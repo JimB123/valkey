@@ -683,6 +683,39 @@ size_t zmalloc_get_rss(void) {
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
 
+/* A precomputed MIB key for querying jemalloc statistics. */
+typedef struct jeMallctlKey {
+    size_t key[6]; /* The precomputed key used to query jemalloc statistics. */
+    size_t keylen; /* The length of the key array. */
+} jeMallctlKey;
+
+static void jeQueryKeyInit(const char *key_name, jeMallctlKey *mib_key) {
+    mib_key->keylen = sizeof(mib_key->key) / sizeof(mib_key->key[0]);
+    int res = je_mallctlnametomib(key_name, mib_key->key, &mib_key->keylen);
+    assert(res == 0);
+}
+
+static void jeQueryCtlInterface(const jeMallctlKey *key_info, size_t *value) {
+    if (!value) return; // Support unsupplied optional values
+    size_t sz = sizeof(*value);
+    int res = je_mallctlbymib(key_info->key, key_info->keylen, value, &sz, NULL, 0);
+    assert(res == 0);
+}
+
+static void jeRefreshStats(void) {
+    static bool initialized = false;
+    static jeMallctlKey mib_epoch;
+    if (!initialized) {
+        jeQueryKeyInit("epoch", &mib_epoch);
+        initialized = true;
+    }
+
+    uint64_t epoch = 1; // Value doesn't matter
+    size_t sz = sizeof(epoch);
+    je_mallctlbymib(mib_epoch.key, mib_epoch.keylen, &epoch, &sz, &epoch, sz);
+}
+
+
 /* Compute the total memory wasted in fragmentation of inside small arena bins.
  * Done by summing the memory in unused regs in all slabs of all small bins. */
 size_t zmalloc_get_frag_smallbins(void) {
@@ -729,37 +762,45 @@ int zmalloc_get_allocator_info(size_t *allocated,
                                size_t *retained,
                                size_t *muzzy,
                                size_t *frag_smallbins_bytes) {
-    uint64_t epoch = 1;
-    size_t sz;
-    *allocated = *resident = *active = 0;
-    /* Update the statistics cached by mallctl. */
-    sz = sizeof(epoch);
-    je_mallctl("epoch", &epoch, &sz, &epoch, sz);
-    sz = sizeof(size_t);
+    static bool initialized = false;
+    static jeMallctlKey mib_stats_resident;
+    static jeMallctlKey mib_stats_active;
+    static jeMallctlKey mib_stats_allocated;
+    static jeMallctlKey mib_stats_retained;
+    static jeMallctlKey mib_stats_arenas_pmuzzy;
+    static jeMallctlKey mib_arenas_page;
+    if (!initialized) {
+        jeQueryKeyInit("stats.resident", &mib_stats_resident);
+        jeQueryKeyInit("stats.active", &mib_stats_active);
+        jeQueryKeyInit("stats.allocated", &mib_stats_allocated);
+        jeQueryKeyInit("stats.retained", &mib_stats_retained);
+        jeQueryKeyInit("stats.arenas." STRINGIFY(MALLCTL_ARENAS_ALL) ".pmuzzy", &mib_stats_arenas_pmuzzy);
+        jeQueryKeyInit("arenas.page", &mib_arenas_page);
+        initialized = true;
+    }
+
+    jeRefreshStats();
     /* Unlike RSS, this does not include RSS from shared libraries and other non
      * heap mappings. */
-    je_mallctl("stats.resident", resident, &sz, NULL, 0);
+    jeQueryCtlInterface(&mib_stats_resident, resident);
     /* Unlike resident, this doesn't not include the pages jemalloc reserves
      * for re-use (purge will clean that). */
-    je_mallctl("stats.active", active, &sz, NULL, 0);
+    jeQueryCtlInterface(&mib_stats_active, active);
     /* Unlike zmalloc_used_memory, this matches the stats.resident by taking
      * into account all allocations done by this process (not only zmalloc). */
-    je_mallctl("stats.allocated", allocated, &sz, NULL, 0);
+    jeQueryCtlInterface(&mib_stats_allocated, allocated);
 
     /* Retained memory is memory released by `madvised(..., MADV_DONTNEED)`, which is not part
      * of RSS or mapped memory, and doesn't have a strong association with physical memory in the OS.
      * It is still part of the VM-Size, and may be used again in later allocations. */
-    if (retained) {
-        *retained = 0;
-        je_mallctl("stats.retained", retained, &sz, NULL, 0);
-    }
+    jeQueryCtlInterface(&mib_stats_retained, retained);
 
     /* Unlike retained, Muzzy representats memory released with `madvised(..., MADV_FREE)`.
      * These pages will show as RSS for the process, until the OS decides to re-use them. */
     if (muzzy) {
         size_t pmuzzy, page;
-        assert(!je_mallctl("stats.arenas." STRINGIFY(MALLCTL_ARENAS_ALL) ".pmuzzy", &pmuzzy, &sz, NULL, 0));
-        assert(!je_mallctl("arenas.page", &page, &sz, NULL, 0));
+        jeQueryCtlInterface(&mib_stats_arenas_pmuzzy, &pmuzzy);
+        jeQueryCtlInterface(&mib_arenas_page, &page);
         *muzzy = pmuzzy * page;
     }
 
