@@ -1,4 +1,4 @@
-#include "config.h"
+#include "fmacros.h"
 #include "bgiteration.h"
 #include "dict.h"
 #include "fifo.h"
@@ -7,10 +7,10 @@
 #include "mutexqueue.h"
 #include "server.h"
 
-int getFlushCommandFlags(client *c, int *flags);    // in db.c
-uint64_t dictObjHash(const void *key);                                      // in server.c
-int dictObjKeyCompare(const void *key1, const void *key2);  // in server.c
-size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid); // in object.c
+int getFlushCommandFlags(client *c, int *flags);                                                        // in db.c
+uint64_t dictObjHash(const void *key);                                                                  // in server.c
+int dictObjKeyCompare(const void *key1, const void *key2);                                              // in server.c
+size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid);                             // in object.c
 robj *createStringObjectWithKeyAndExpire(const char *ptr, size_t len, const sds key, long long expire); // in object.c
 
 
@@ -21,20 +21,20 @@ bool hashtableInternalIteratorIsBucketIdxComplete(hashtableIterator *iterator);
 hashtableIterator *kvstoreInternalIteratorGetCurrentHashtableIterator(kvstoreIterator *kvs_it);
 
 
-static bool receiveItemsBackFromOneIterator(bgIterator *it);    // in bgiteration.c - forward declaration
+static bool receiveItemsBackFromOneIterator(bgIterator *it); // in bgiteration.c - forward declaration
 
-//################  TEMP COMPILE HACKS   ###########################
+// ################  TEMP COMPILE HACKS   ###########################
 // Issue found.  server.db has changed from an array of db to an array of pointers to db (change all refs to server.db)
 // Issue: iterators (kvstore/hashtable) are not safe across event loop invocations.  Hashtable (kvstore?) needs to track and maintain safe iterators.
 
 
 // Don't think there's any current need for this...
-static bool ignoreKeyForSave(sds key) {
+static bool ignoreKeyForSave(const_sds key) {
     UNUSED(key);
     return false;
 }
 
-void amzUnblockClientsOnKey(void *info, robj *key); // temp for mock
+void amzUnblockClientsOnKey(void *info, robj *key);                       // temp for mock
 int amzBlockClientOnKeys(void *info, client *c, robj *keys[], int nKeys); // temp for mock
 
 //------- END OF COMPILE HACKS -------------------
@@ -42,18 +42,13 @@ int amzBlockClientOnKeys(void *info, client *c, robj *keys[], int nKeys); // tem
 
 // Returns true if the cmd is a script command that may replicate.
 static bool isScriptCallWriteCmd(struct serverCommand *cmd) {
-    return ((cmd->proc == fcallCommand)
-            || (cmd->proc == evalCommand)
-            || (cmd->proc == evalShaCommand));
+    return ((cmd->proc == fcallCommand) || (cmd->proc == evalCommand) || (cmd->proc == evalShaCommand));
 }
 
 // The PFCOUNT command (which does NOT have the CMD_WRITE flag) modifies the underlying string and
 //  is replicated as a write.  So it needs to be detected and handled specially.
 static bool isWriteCmd(struct serverCommand *cmd) {
-    return ((cmd->flags & CMD_WRITE)
-            || (cmd->proc == pfcountCommand) 
-            || (cmd->proc == execCommand)
-            || (isScriptCallWriteCmd(cmd)));
+    return ((cmd->flags & CMD_WRITE) || (cmd->proc == pfcountCommand) || (cmd->proc == execCommand) || (isScriptCallWriteCmd(cmd)));
 }
 
 // Returns true if the command is a deletion based command (DEL or UNLINK)
@@ -78,7 +73,7 @@ static bool getDbIdFromRobj(robj *obj, int *db_id) {
 }
 
 /* Parse the parameters of the COPY command, extracting the target DBID.
- * Returns FALSE if the 
+ * Returns FALSE if the command would not run.
  */
 static bool getTargetDbIdForCopyCommand(int argc, robj **argv, int selected_dbid, int *target_dbid) {
     const int COPY_COMMAND_OPTIONAL_ARG_START_INDEX = 3;
@@ -95,11 +90,11 @@ static bool getTargetDbIdForCopyCommand(int argc, robj **argv, int selected_dbid
              *    COPY key1 key2 db 1 db 2 db 3    // (This will use db 3)
              */
             if (!getDbIdFromRobj(argv[i + 1], target_dbid)) {
-                return false;   // parse failure
+                return false; // parse failure
             }
             i++; // Consume additional argument
         } else {
-            return false;   // parse failure
+            return false; // parse failure
         }
     }
     return true;
@@ -131,7 +126,7 @@ bool getParamsForSwapdb(int argc, robj **argv, client *permission_client, int *i
     if (getLongLongFromObject(argv[2], &dbid2) != C_OK) return false;
     if (dbid1 < 0 || dbid1 >= server.dbnum) return false;
     if (dbid2 < 0 || dbid2 >= server.dbnum) return false;
-    if (dbid1 == dbid2) return false;   // Valid, but doesn't do anything
+    if (dbid1 == dbid2) return false;  // Valid, but doesn't do anything
 
     *id1_p = (int)dbid1;
     *id2_p = (int)dbid2;
@@ -187,8 +182,8 @@ static void decrRefCountVoid(void *o) {
 /* Concatenate argc/argv into a command string for debugging. */
 static sds createSdsFromClientArgv(int argc, robj **argv) {
     sds cmd = sdsempty();
-    for (int i = 0;  i < argc;  i++) {
-        robj *arg = getDecodedObject(argv[i]);  // some objects are int encoded
+    for (int i = 0; i < argc; i++) {
+        robj *arg = getDecodedObject(argv[i]); // some objects are int encoded
         cmd = sdscatprintf(cmd, "'%s' ", (char *)objectGetVal(arg));
         decrRefCount(arg);
     }
@@ -200,14 +195,28 @@ static sds createSdsFromClientArgv(int argc, robj **argv) {
 
 
 /* bgIteration internal (compile time) configuration values */
-static const int BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE = 16384;    // Prevent initial rehashing
-static const int BGITER_MAX_CLONE_ITEM_BYTES = 512;                 // Max size item to clone
-static const int BGITER_MAX_CLONE_POOL_BYTES = (1 * 1024 * 1024);   // Total limit for all cloned items
-static const int BGITER_QUEUE_INCREASE_INCR = 100;                  // Step size when increasing queue target
-static const int BGITER_CYCLE_DELAY_MS = 2;                         // Delay between calls on bgIteration timer
-static const int BGITER_CYCLE_BUDGET_MS = 1;                        // Normal time limit for timer processing
-static const int BGITER_CYCLE_BUDGET_MAX_MS = 10;                   // Maximum time limit when starvation seen
+enum {
+    BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE = 16384,    // Prevent initial rehashing
+    BGITER_MAX_CLONE_ITEM_BYTES = 512,                 // Max size item to clone
+    BGITER_MAX_CLONE_POOL_BYTES = (1 * 1024 * 1024),   // Total limit for all cloned items
+    BGITER_QUEUE_INCREASE_INCR = 100,                  // Step size when increasing queue target
+    BGITER_CYCLE_DELAY_MS = 2,                         // Delay between calls on bgIteration timer
+    BGITER_CYCLE_BUDGET_MS = 1,                        // Normal time limit for timer processing
+    BGITER_CYCLE_BUDGET_MAX_MS = 10                    // Maximum time limit when starvation seen
+};
 
+// These can be tweaked by unit tests
+static int bgiter_max_clone_item_bytes = BGITER_MAX_CLONE_ITEM_BYTES;
+static int bgiter_max_clone_pool_bytes = BGITER_MAX_CLONE_POOL_BYTES;
+
+void bgIteration_unitTestDisableCloning(void) {
+    bgiter_max_clone_item_bytes = 0;
+    bgiter_max_clone_pool_bytes = 0;
+}
+void bgIteration_unitTestEnableCloning(int item_bytes, int pool_bytes) {
+    bgiter_max_clone_item_bytes = item_bytes;
+    bgiter_max_clone_pool_bytes = pool_bytes;
+}
 
 typedef enum {
     BGITERATION_TYPE_NONE,
@@ -247,12 +256,12 @@ static int neverShrink(size_t moreMem, double usedRatio) {
 
 // Thomas Wang's 64-bit mix
 static uint64_t pointerHash(const void *key) {
-    uint64_t h = (uint64_t)key;
-    h = (~h) + (h << 21);           // h = (h << 21) - h - 1;
+    uint64_t h = (uint64_t)(uintptr_t)key;
+    h = (~h) + (h << 21); // h = (h << 21) - h - 1;
     h = h ^ (h >> 24);
-    h = (h + (h << 3)) + (h << 8);  // h * 265
+    h = (h + (h << 3)) + (h << 8); // h * 265
     h = h ^ (h >> 14);
-    h = (h + (h << 2)) + (h << 4);  // h * 21
+    h = (h + (h << 2)) + (h << 4); // h * 21
     h = h ^ (h >> 28);
     h = h + (h << 31);
     return h;
@@ -286,9 +295,9 @@ typedef void   (*iteratorReleaseFunc)       (genericIterator *genIt);
 typedef fifo * (*iteratorGetEntriesFunc)    (genericIterator *genIt, int *orig_dbid, int *cur_dbid);
 typedef void   (*iteratorSwapDbFunc)        (genericIterator *genIt, int db1, int db2);
 typedef void   (*iteratorFlushDbFunc)       (genericIterator *genIt, int cur_dbid);
-typedef bool   (*iteratorHasPassedItemFunc) (genericIterator *genIt, const sds key, int cur_dbid);
+typedef bool   (*iteratorHasPassedItemFunc) (genericIterator *genIt, const_sds key, int cur_dbid);
 typedef int    (*iteratorOriginalDbFunc)    (genericIterator *genIt, int cur_dbid);
-typedef bool   (*iteratorIsKeyInScopeFunc)  (genericIterator *genIt, const sds key);
+typedef bool   (*iteratorIsKeyInScopeFunc)  (genericIterator *genIt, const_sds key);
 
 // Function pointers supporting polymorphic iterator implementation
 struct genericIterator {
@@ -342,49 +351,48 @@ static void itemFreeList_release(void) {
 // This struct is used across threads.  Unless otherwise noted, the fields are initialized at
 //  iterator creation (within the main thread) and are read-only by the client thread.
 struct bgIterator {
-    sds name;                           // Iterator name
-    bgIteratorReplDoneFunc repldone;    // Optional repldone function to be run on the main thread
-    bgIteratorCleanupFunc cleanup;      // Optional cleanup function to be run on main thread
-    void *privdata;                     // Client's private data to be passed to cleanup function
+    sds name;                        // Iterator name
+    bgIteratorReplDoneFunc repldone; // Optional repldone function to be run on the main thread
+    bgIteratorCleanupFunc cleanup;   // Optional cleanup function to be run on main thread
+    void *privdata;                  // Client's private data to be passed to cleanup function
 
-    int iteration_flags;                // Consistent and/or Replication
-    int iteration_type;                 // Full scan or cluster slot
-    uint32_t consistent_modification_id;// iterator epoch at time of iterator creation
+    int iteration_flags;                 // Consistent and/or Replication
+    int iteration_type;                  // Full scan or cluster slot
+    uint32_t consistent_modification_id; // iterator epoch at time of iterator creation
 
-    genericIterator *keyset_iter;   // Low-level iterator (polymorphic)
+    genericIterator *keyset_iter; // Low-level iterator (polymorphic)
 
-    dict *early_iterate_entries;    // Used to keep track of what items have already been iterated
-                                    // over by out-of-order expedited process, ensuring a bgIterator 
-                                    // does not try to reprocess items.
-                                    // Used only by main thread.
-                                    // dictEntry -> NULL
+    dict *early_iterate_entries; // Used to keep track of what items have already been iterated
+                                 // over by out-of-order expedited process, ensuring a bgIterator 
+                                 // does not try to reprocess items.
+                                 // Used only by main thread.
+                                 // dictEntry -> NULL
 
     mutexQueue *items_for_iterator; // Created/Destroyed in main thread, used in both (threadsafe)
 
-    mutexQueue *return_to_valkey;   // Queue of items to be returned to the Valkey main thread (threadsafe)
+    mutexQueue *return_to_valkey; // Queue of items to be returned to the Valkey main thread (threadsafe)
     
     unsigned int item_count_target; // Used only by main thread
 
-                                    // current_item is normally only used in the iteration client.
-                                    //  It's marked volatile here only to support snooping from the
-                                    //  main thread when handling a FLUSHDB command.  This prevents
-                                    //  the compiler from generating code which might read the
-                                    //  pointer multiple times (when it's coded to read only once).
-                                    // Also - this syntax is for a volatile POINTER to a
-                                    //  non-volatile item.  "volatile" at the beginning of the
-                                    //  declaration, would indicate a (non-volatile) pointer to a
-                                    //  volatile item.
-    bgIteratorItem *volatile current_item;
+    bgIteratorItem *volatile current_item; // current_item is normally only used in the iteration client.
+                                           //  It's marked volatile here only to support snooping from the
+                                           //  main thread when handling a FLUSHDB command.  This prevents
+                                           //  the compiler from generating code which might read the
+                                           //  pointer multiple times (when it's coded to read only once).
+                                           // Also - this syntax is for a volatile POINTER to a
+                                           //  non-volatile item.  "volatile" at the beginning of the
+                                           //  declaration, would indicate a (non-volatile) pointer to a
+                                           //  volatile item.
 
-    bool client_is_active;          // Set to true when client performs 1st read
-    bool completed;                 // Set to true in main thread when last item from iteration has
-                                    //  been queued to the client.  No additional items will be
-                                    //  enqueued to the client after this has been set.
+    bool client_is_active; // Set to true when client performs 1st read
+    bool completed;        // Set to true in main thread when last item from iteration has
+                           //  been queued to the client.  No additional items will be
+                           //  enqueued to the client after this has been set.
 
-    volatile bool terminated;       // Set to true in main thread when iteration is to be killed
-                                    // Set to true in iteration client when it decides to end early
+    volatile bool terminated; // Set to true in main thread when iteration is to be killed
+                              // Set to true in iteration client when it decides to end early
 
-    bool cur_cmd_may_replicate;     // Used only in main thread during command processing
+    bool cur_cmd_may_replicate; // Used only in main thread during command processing
 
     // Variables maintaining runtime statistics
     unsigned long dbentries_queued;         // Updated by main thread
@@ -399,21 +407,20 @@ struct bgIterator {
     unsigned long dbentry_clones_processed; // Updated by client thread
     monotime monotonic_start_time;          // Time iteration started
 
-                                    // The item start time is set in the iteration client.  It is
-                                    //  marked volatile as it can be read from the main thread by
-                                    //  bgIteratorGetStatus.  If 0, this indicates that the
-                                    //  iteration client is waiting for an item to process.
-    volatile monotime monotonic_item_start_time;     // Time current item processing started
+    volatile monotime monotonic_item_start_time; // The item start time is set in the iteration client.  It is
+                                                 //  marked volatile as it can be read from the main thread by
+                                                 //  bgIteratorGetStatus.  If 0, this indicates that the
+                                                 //  iteration client is waiting for an item to process.
 };
 
 
 // These static values are only accessed from the main Valkey thread.
 
-static list *allIterators;      // list of bgIterator
-static dict *nameToIterator;    // bgIterator->name -> bgIterator
+static list *allIterators;   // list of bgIterator
+static dict *nameToIterator; // bgIterator->name -> bgIterator
 
 // Global, across all iterators, dict contains a dbEntry pointer -> ref count
-static dict *inUseEntries;      // dbEntry -> ref count
+static dict *inUseEntries; // dbEntry -> ref count
 
 // Key values in the current command which don't exist in the DB yet.  Needed for determination of
 //  replication for NON-consistent iterations.
@@ -433,8 +440,8 @@ static int last_item_count_target;
 // Eventloop ID of the timerproc (or AE_DELETED_EVENT_ID)
 static long long bgIterator_timeproc_id;
 
-/* PUBLIC API - this is read whenever a dbEntry is modified in Valkey. */
-uint32_t bgIteration_epoch;
+// Incremented on each new iteration, this is updated in dbEntry metadata whenever an entry is modified.
+static uint32_t bgIteration_epoch = 1;
 
 
 // BgIteration debug captures BgIteration activity to a large sds buffer.  When an iterator is
@@ -447,7 +454,7 @@ uint32_t bgIteration_epoch;
 //  debugging code at compile time.  There is no run-time performance overhead when set to FALSE.
 //  This is essentially like an IFDEF, however, it's better as it forces the compiler to validate
 //  syntax.
-static const bool BGITERATION_DEBUG = false;   // DO NOT SUBMIT WITH THIS SYMBOL SET TO TRUE!
+static const bool BGITERATION_DEBUG = false; // DO NOT SUBMIT WITH THIS SYMBOL SET TO TRUE!
 static sds debugBuffer;
 
 
@@ -462,7 +469,7 @@ static sds debugBuffer;
  */
 
 struct fullScanIterator {
-    genericIterator callbacks;  // (must be first item)
+    genericIterator callbacks; // (must be first item)
 
     // Array of mapping from original DB ID (at the time of iteration start) to that DB's
     //  current index.  So, if the DB which was DB-0 is now at index 6, orig_to_cur_db[0]==6.
@@ -478,7 +485,7 @@ struct fullScanIterator {
     int iter_db;
 
     // Iterator for the DB orig_to_cur_db[iter_db]
-    kvstore *kvs;   // keep track of kvs associated with iter_dbi
+    kvstore *kvs; // keep track of kvs associated with iter_dbi
     kvstoreIterator *iter_dbi;
 };
 
@@ -492,14 +499,14 @@ static void fullScanIteratorRelease(genericIterator *genIt) {
 
 static fifo * fullScanIteratorGetEntries(genericIterator *genIt, int *orig_dbid, int *cur_dbid) {
     struct fullScanIterator *it = (struct fullScanIterator *)genIt;
-    if (it->iter_db >= server.dbnum) return NULL;   // Finished scanning
+    if (it->iter_db >= server.dbnum) return NULL; // Finished scanning
 
     fifo *dbEntryFifo = fifoCreate();
     while (fifoLength(dbEntryFifo) == 0) {
         while (it->iter_dbi == NULL) {
             if (++it->iter_db >= server.dbnum) {
                 fifoRelease(dbEntryFifo);
-                return NULL;    // Iteration complete
+                return NULL; // Iteration complete
             }
             serverDb *db = server.db[it->orig_to_cur_db[it->iter_db]];
             if (db != NULL) {
@@ -548,19 +555,19 @@ static void fullScanIteratorFlushDb(genericIterator *genIt, int cur_dbid) {
     }
 }
 
-static bool fullScanIteratorHasPassedItem(genericIterator *genIt, const sds key, int cur_dbid) {
+static bool fullScanIteratorHasPassedItem(genericIterator *genIt, const_sds key, int cur_dbid) {
     struct fullScanIterator *it = (struct fullScanIterator *) genIt;
     int orig_dbid = it->cur_to_orig_db[cur_dbid];
 
-    if (orig_dbid < it->iter_db) return true;   // Entire DB has already been processed
-    if (orig_dbid > it->iter_db) return false;  // Haven't started this DB yet
+    if (orig_dbid < it->iter_db) return true;  // Entire DB has already been processed
+    if (orig_dbid > it->iter_db) return false; // Haven't started this DB yet
     // Now, orig_dbid == it->iter_db
 
-    if (it->iter_dbi == NULL) return true;       // just finished this DB
+    if (it->iter_dbi == NULL) return true; // just finished this DB
 
     // We're in the middle of processing a DB.  In cluster-mode, the DB is divided into 1 hashtable
     //  per slot.  In cluster-mode-disabled, we treat all keys as in slot 0.
-    int keySlot = server.cluster_enabled ? getKeySlot(key) : 0;
+    int keySlot = server.cluster_enabled ? getKeySlot((sds)key) : 0;
     if (keySlot < kvstoreIteratorGetCurrentHashtableIndex(it->iter_dbi)) return true;
     if (keySlot > kvstoreIteratorGetCurrentHashtableIndex(it->iter_dbi)) return false;
 
@@ -570,20 +577,20 @@ static bool fullScanIteratorHasPassedItem(genericIterator *genIt, const sds key,
     int table; // 0 or 1 (supporting rehashing)
     size_t index; // bucket number within the hashtable
     // If key doesn't exist, we consider it passed - we MIGHT have iterated over it had it existed.
-    if (!hashtableInternalFindBucketIdx(iter_current_ht, key, &table, &index)) return true;
+    if (!hashtableInternalFindBucketIdx(iter_current_ht, (void *)key, &table, &index)) return true;
 
     hashtableIterator *htIter = kvstoreInternalIteratorGetCurrentHashtableIterator(it->iter_dbi);
     int iter_table;
     size_t iter_index;
     hashtableInternalIteratorGetBucketIdx(htIter, &iter_table, &iter_index);
-    if (table < iter_table) return true;       // iteration in table 1, but item is in table 0
-    if (table > iter_table) return false;      // iteration in table 0, but item is in table 1
+    if (table < iter_table) return true;  // iteration in table 1, but item is in table 0
+    if (table > iter_table) return false; // iteration in table 0, but item is in table 1
     // if index <= iterator index, it has been passed. bgIterator
     // processes buckets atomically. hashtableIterator points to the
     // last returned position. It means bucket at iter_index has
     // already been processed.
     if (index <= iter_index) return true;
-    if (ignoreKeyForSave(key)) return true;    // if slot being purged, pretend we have passed it
+    if (ignoreKeyForSave(key)) return true; // if slot being purged, pretend we have passed it
     return false;
 }
 
@@ -592,17 +599,17 @@ static int fullScanIteratorOriginalDb(genericIterator *genIt, int cur_dbid) {
     return it->cur_to_orig_db[cur_dbid];
 }
 
-static bool fullScanIteratorIsKeyInScope(genericIterator *genIt, const sds key) {
+static bool fullScanIteratorIsKeyInScope(genericIterator *genIt, const_sds key) {
     UNUSED(genIt);
     UNUSED(key);
-    return true;    // All keys are in scope
+    return true; // All keys are in scope
 }
 
 static genericIterator * fullScanIteratorCreate(void) {
     struct fullScanIterator *it = zmalloc(sizeof(struct fullScanIterator));
     it->orig_to_cur_db = zmalloc(sizeof(int) * server.dbnum);
     it->cur_to_orig_db = zmalloc(sizeof(int) * server.dbnum);
-    for (int i = 0;  i < server.dbnum;  i++) {
+    for (int i = 0; i < server.dbnum; i++) {
         it->orig_to_cur_db[i] = i;
         it->cur_to_orig_db[i] = i;
     }
@@ -630,54 +637,54 @@ static genericIterator * fullScanIteratorCreate(void) {
  * iterator is only used from within the Valkey main thread.
  */
 struct clusterSlotIterator {
-    genericIterator callbacks;  // (must be first item)
+    genericIterator callbacks; // (must be first item)
 };
 
 static void clusterSlotIteratorRelease(genericIterator *genIt) {
     UNUSED(genIt);
-    serverAssert(false);    // Not yet implemented
+    serverAssert(false); // Not yet implemented
 }
 
 static fifo * clusterSlotIteratorGetEntries(genericIterator *genIt, int *orig_dbid, int *cur_dbid) {
     UNUSED(genIt);
     UNUSED(orig_dbid);
     UNUSED(cur_dbid);
-    serverAssert(false);    // Not yet implemented
+    serverAssert(false); // Not yet implemented
 }
 
 static void clusterSlotIteratorSwapDb(genericIterator *genIt, int db1, int db2) {
     UNUSED(genIt);
     UNUSED(db1);
     UNUSED(db2);
-    serverAssert(false);    // swap not valid in cluster mode
+    serverAssert(false); // swap not valid in cluster mode
 }
 
 static void clusterSlotIteratorFlushDb(genericIterator *genIt, int cur_dbid) {
     UNUSED(genIt);
     UNUSED(cur_dbid);
-    serverAssert(false);    // Not yet implemented
+    serverAssert(false); // Not yet implemented
 }
 
-static bool clusterSlotIteratorHasPassedItem(genericIterator *genIt, const sds key, int cur_dbid) {
+static bool clusterSlotIteratorHasPassedItem(genericIterator *genIt, const_sds key, int cur_dbid) {
     UNUSED(genIt);
     UNUSED(key);
     UNUSED(cur_dbid);
-    serverAssert(false);    // Not yet implemented
+    serverAssert(false); // Not yet implemented
 }
 
 static int clusterSlotIteratorOriginalDb(genericIterator *genIt, int cur_dbid) {
     UNUSED(genIt);
     UNUSED(cur_dbid);
-    return cur_dbid;        // swap not supported in cluster mode
+    return cur_dbid; // swap not supported in cluster mode
 }
 
 /* When checking if a command is in scope for this iterator, all of its keys should be either in
  * scope or not. In cluster mode enabled a command cannot reference keys from different slots, so
  * this assumption will always be true. */
-static bool clusterSlotIteratorIsKeyInScope(genericIterator *genIt, const sds key) {
+static bool clusterSlotIteratorIsKeyInScope(genericIterator *genIt, const_sds key) {
     UNUSED(genIt);
     UNUSED(key);
-    serverAssert(false);    // Not yet implemented
+    serverAssert(false); // Not yet implemented
 }
 
 static genericIterator * clusterSlotIteratorCreate(const int *slots, size_t slots_count) {
@@ -692,7 +699,7 @@ static genericIterator * clusterSlotIteratorCreate(const int *slots, size_t slot
 
     UNUSED(slots);
     UNUSED(slots_count);
-    serverAssert(false);    // Not yet implemented
+    serverAssert(false); // Not yet implemented
 
     return (genericIterator *)it;
 }
@@ -777,13 +784,13 @@ static ssize_t computeStringDbEntrySize(dbEntry *de) {
     sds key = objectGetKey(de);
     size_t valueSize = stringObjectLen(de);
 
-    return sdslen(key) + valueSize;     // ignore the rest of the overhead, it's minor & transient
+    return sdslen(key) + valueSize; // ignore the rest of the overhead, it's minor & transient
 }
 
 
 static dbEntry *tryCloneDbEntry(dbEntry *de) {
-    if (bgiteration_current_clone_memory_pool_size + BGITER_MAX_CLONE_ITEM_BYTES 
-            > BGITER_MAX_CLONE_POOL_BYTES) {
+    if (bgiteration_current_clone_memory_pool_size + bgiter_max_clone_item_bytes 
+            > bgiter_max_clone_pool_bytes) {
         return NULL;
     }
 
@@ -792,7 +799,7 @@ static dbEntry *tryCloneDbEntry(dbEntry *de) {
     if (de->type == OBJ_STRING && de->encoding != OBJ_ENCODING_INT) {
         ssize_t itemSize = computeStringDbEntrySize(de);
 
-        if (itemSize <= BGITER_MAX_CLONE_ITEM_BYTES) {
+        if (itemSize <= bgiter_max_clone_item_bytes) {
             bgiteration_current_clone_memory_pool_size += itemSize;
             dbEntry *clone = createStringObjectWithKeyAndExpire((char *)objectGetVal(de), sdslen(objectGetVal(de)), objectGetKey(de), objectGetExpire(de));
             ((bgIterationEntryMetadata *)objectGetMetadata(clone))->iterator_epoch
@@ -829,7 +836,7 @@ static bgIteratorItem * makeDbEntryItem(dbEntry *de, int dbid, bool isCloned) {
 
 static robj ** cloneRobjArray(int argc, robj **argv) {
     robj **newarray = zmalloc(sizeof(robj*) * argc);
-    for (int i = 0;  i < argc;  i++) {
+    for (int i = 0; i < argc; i++) {
         newarray[i] = argv[i];
         incrRefCount(argv[i]);
     }
@@ -838,7 +845,7 @@ static robj ** cloneRobjArray(int argc, robj **argv) {
 
 
 static void freeRobjArray(int argc, robj **argv) {
-    for (int i = 0;  i < argc;  i++) {
+    for (int i = 0; i < argc; i++) {
         decrRefCount(argv[i]);
     }
     zfree(argv);
@@ -930,7 +937,7 @@ static sds createEntryString(int dbid, dbEntry *de) {
     sds entrySds = sdsempty();
     entrySds = sdscatprintf(entrySds, "(%d)'%s'", dbid, key);
     if (de->type == OBJ_STRING) {
-        robj *o = getDecodedObject(de);    // might be encoded as int
+        robj *o = getDecodedObject(de); // might be encoded as int
         const unsigned valuePrintLen = 20;
         entrySds = sdscatprintf(entrySds, " : '%.*s'", valuePrintLen, (char *)objectGetVal(o));
         if (sdslen((sds)objectGetVal(o)) > valuePrintLen) entrySds = sdscat(entrySds, "...");
@@ -1072,7 +1079,7 @@ static bool addEarlyIterationKey(bgIterator *it, dbEntry *earlyEntry, int cur_db
     it->dbentries_queued++;
     if (isClonedEntry) it->dbentry_clones_queued++;
 
-    if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) {
+    if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) { // JHB - can we optimize here in cluster mode (no swap)
         // On consistent iteration, SWAPDB events are not provided.  So there is no requirement to
         //  keep items in order or synchronized with SWAPDB.
         if (BGITERATION_DEBUG) {
@@ -1254,11 +1261,11 @@ static bool expediteKeysForWrite(
 
     if (it->iteration_flags & BGITERATOR_FLAG_CONSISTENT) {
         // CONSISTENT = YES, REPLICATION = YES / NO
-        for (int i = 0;  i < numKeys;  i++) {
+        for (int i = 0; i < numKeys; i++) {
             robj *oKey = argv[keyrefs[i].pos];
             sds key = objectGetVal(oKey);
             dbEntry *de = dbFind(server.db[dbid], key);
-            if (de == NULL) continue;  // New key, no need to expedite
+            if (de == NULL) continue; // New key, no need to expedite
             if (!(iterComplete || it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid))
                     && dictFind(it->early_iterate_entries, de) == NULL
                     && ((bgIterationEntryMetadata *)objectGetMetadata(de))->iterator_epoch <= it->consistent_modification_id) {
@@ -1273,7 +1280,7 @@ static bool expediteKeysForWrite(
                 }
             }
         }
-        it->cur_cmd_may_replicate = true;   // Will replicate only if replication enabled
+        it->cur_cmd_may_replicate = true; // Will replicate only if replication enabled
     } else {
         // Identification of missing keys is only needed for non-consistent iteration.  This only
         //  needs to be collected once (on the 1st non-consistent iteration)
@@ -1284,7 +1291,7 @@ static bool expediteKeysForWrite(
             bool someIterated = false;
             // dict containing the keys that have not been iterated yet.
             //  Using a dict dedupes the keys in case the command contains duplicated keys.
-            dict *notIteratedKeys = dictCreate(&dictEntryPtrDictType);    // dict of dbEntry* -> robj*
+            dict *notIteratedKeys = dictCreate(&dictEntryPtrDictType); // dict of dbEntry* -> robj*
 
             for (int i = 0; i < numKeys; i++) {
                 robj *oKey = argv[keyrefs[i].pos];
@@ -1351,7 +1358,7 @@ static bool expediteKeysForWrite(
             dictRelease(notIteratedKeys);
         } else {
             // CONSISTENT = NO,  REPLICATION = NO
-            for (int i = 0;  i < numKeys;  i++) {
+            for (int i = 0; i < numKeys; i++) {
                 robj *oKey = argv[keyrefs[i].pos];
                 sds key = objectGetVal(oKey);
                 dbEntry *de = dbFind(server.db[dbid], key);
@@ -1380,7 +1387,7 @@ static void returnAllItemsToValkey(bgIterator *it) {
     serverAssert(onValkeyMainThread());
 
     fifo *poppedFifo = mutexQueuePopAll(it->items_for_iterator, false);
-    if (poppedFifo == NULL) return;   // Nothing to return
+    if (poppedFifo == NULL) return; // Nothing to return
 
     // Release non-dictentry items first...
     fifo *itemsToReturn = fifoCreate();
@@ -1407,13 +1414,13 @@ static void returnAllItemsToValkey(bgIterator *it) {
                 // This can only happen if the completion item has been enqueued and
                 //  the iterator is terminated before reaching the completion item.
                 itemFreeList_returnItemBackToFreeList(item);
-                continue;   // Skip pushing this onto itemsToReturn
+                continue; // Skip pushing this onto itemsToReturn
 
             case BGITERATOR_ITEM_TERMINATED:
                 // This can only happen if there is a race when terminating between
                 //  the iteration client and main thread.
                 itemFreeList_returnItemBackToFreeList(item);
-                continue;   // Skip pushing this onto itemsToReturn
+                continue; // Skip pushing this onto itemsToReturn
 
             default:
                 serverAssert(false);
@@ -1439,7 +1446,7 @@ static void returnAllItemsToValkey(bgIterator *it) {
 static size_t replicationItemSize(bgIteratorItem *item) {
     serverAssert(item->type == BGITERATOR_ITEM_REPLICATION);
     size_t itemSize = sizeof(bgIteratorItem);
-    for (int i = 0;  i < item->u.repl.argc;  i++) {
+    for (int i = 0; i < item->u.repl.argc; i++) {
         itemSize += objectComputeSize(NULL, item->u.repl.argv[i], 0, 0);
     }
     return itemSize;
@@ -1501,7 +1508,7 @@ static void processReturnOfItemToValkey(bgIteratorItem *item, bgIterator *iter) 
                 serverAssert(it->flushdb_queued        == it->flushdb_processed);
                 serverAssert(it->dbentry_clones_queued >= it->dbentry_clones_processed);
 
-                listEmpty(curCmdMissingKeys);   // Just in case any remain
+                listEmpty(curCmdMissingKeys); // Just in case any remain
 
                 itemFreeList_returnItemBackToFreeList(it->current_item);
                 it->current_item = NULL;
@@ -1509,7 +1516,7 @@ static void processReturnOfItemToValkey(bgIteratorItem *item, bgIterator *iter) 
                 bool terminated = it->terminated;
                 void *privdata = it->privdata;
                 bgIteratorCleanupFunc cleanup = it->cleanup;
-                bgIteratorRelease(it);  // Fully release the iterator before calling cleanup
+                bgIteratorRelease(it); // Fully release the iterator before calling cleanup
 
                 if (BGITERATION_DEBUG) {
                     if (cleanup) debugBuffer = sdscatprintf(debugBuffer, "CLEANUP FN (%s)\n",
@@ -1531,7 +1538,7 @@ static void processReturnOfItemToValkey(bgIteratorItem *item, bgIterator *iter) 
             break;
 
         default:
-            serverAssert(false);    // Not expecting any other type of item!
+            serverAssert(false); // Not expecting any other type of item!
     }
 
     // We don't allocate extension items from the pool so we manually free them
@@ -1598,7 +1605,7 @@ static void receiveItemsBackFromIterators(bool blocking) {
             bgIterator *it = listNodeValue(node);
             processedItems |= receiveItemsBackFromOneIterator(it);
         }
-        if (blocking) usleep(100);    // Sleep for 1ms and re-try processing iterators
+        if (blocking) usleep(100); // Sleep for 1ms and re-try processing iterators
     } while (blocking && !processedItems);
 }
 
@@ -1612,7 +1619,7 @@ static long long bgIteration_feedIterators_task(
     UNUSED(clientData);
     serverAssert(onValkeyMainThread());
 
-    static monotime lastFeedEndTime;    // STATIC: Persists For checking starvation
+    static monotime lastFeedEndTime; // STATIC: Persists For checking starvation
     monotime startTime = getMonotonicUs();
 
     if (!bgIteration_iterationActive()) {
@@ -1799,16 +1806,16 @@ static void removePtrFromEarlyIterate(dbEntry *de) {
     listRewind(allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
-        dictDelete(it->early_iterate_entries, de);   // just try delete (might not be here)
+        dictDelete(it->early_iterate_entries, de); // just try delete (might not be here)
     }
 }
 
 
 static int findDbForEntry(dbEntry *de) {
-    for (int i = 0;  i < server.dbnum;  i++) {
+    for (int i = 0; i < server.dbnum; i++) {
         if (dbFind(server.db[i], objectGetKey(de)) == de) return i;
     }
-    serverAssert(false);    // the entry MUST be in one of the DBs
+    serverAssert(false); // the entry MUST be in one of the DBs
 }
 
 
@@ -1884,7 +1891,7 @@ static void preserveIteratorItemsForFlush(bgIterator *it, int dbid) {
 
 static bool isDbSignificant(int dbid) {
     unsigned long long totalKeys = 0;
-    for (int i = 0;  i < server.dbnum;  i++) {
+    for (int i = 0; i < server.dbnum; i++) {
         totalKeys += dbSize(server.db[i]);
     }
     return dbSize(server.db[dbid]) > totalKeys / 2;
@@ -1926,7 +1933,7 @@ static void handleFlushdb(int dbid) {
             mutexQueueAdd(it->items_for_iterator, item);
         }
     }
-    receiveItemsBackFromIterators(false);   // Receive items back before flushing the items
+    receiveItemsBackFromIterators(false); // Receive items back before flushing the items
 }
 
 
@@ -2004,7 +2011,7 @@ static bool expediteKeysForMultiExec(client *c, dict *waitingOnKeys) {
     int *cur_to_orig_db = NULL;
 
     int curDb = c->db->id;
-    for (int cmdNum = 0;  cmdNum < c->mstate->count;  cmdNum++) {
+    for (int cmdNum = 0; cmdNum < c->mstate->count; cmdNum++) {
         struct serverCommand *cmd = c->mstate->commands[cmdNum].cmd;
         robj **argv = c->mstate->commands[cmdNum].argv;
         int argc = c->mstate->commands[cmdNum].argc;
@@ -2014,7 +2021,7 @@ static bool expediteKeysForMultiExec(client *c, dict *waitingOnKeys) {
             if (getParamsForSwapdb(argc, argv, c, &id1, &id2)) {
                 if (cur_to_orig_db == NULL) {
                     cur_to_orig_db = zmalloc(sizeof(int) * server.dbnum);
-                    for (int i = 0;  i < server.dbnum;  i++) cur_to_orig_db[i] = i;
+                    for (int i = 0; i < server.dbnum; i++) cur_to_orig_db[i] = i;
                 }
                 int temp = cur_to_orig_db[id1];
                 cur_to_orig_db[id1] = cur_to_orig_db[id2];
@@ -2037,7 +2044,7 @@ static bool expediteKeysForMultiExec(client *c, dict *waitingOnKeys) {
         initGetKeysResult(&result);
         int numkeys = getKeysFromCommand(cmd, argv, argc, &result);
         keyReference *keyrefs = result.keys;
-        if (numkeys == 0) continue;         // Write command with no keys - like FLUSHDB
+        if (numkeys == 0) continue; // Write command with no keys - like FLUSHDB
 
         if (expediteKeysForWriteOnAllIterators(
                 cur_to_orig_db ? cur_to_orig_db[curDb] : curDb,
@@ -2248,7 +2255,7 @@ bgIteratorItem * bgIteratorRead(bgIterator *it) {
         it->client_is_active = true;
     }
 
-    it->monotonic_item_start_time = 0;  // idle until blocking pop returns
+    it->monotonic_item_start_time = 0; // idle until blocking pop returns
     it->current_item = mutexQueuePop(it->items_for_iterator, true);
     it->monotonic_item_start_time = getMonotonicUs();
 
@@ -2296,7 +2303,7 @@ void bgIteration_init(void) {
 
     /* This should be called once and only once from the Valkey main thread.  However to support
      * unit tests, this is not validated, and multiple invocations are ignored.  */
-    if (nameToIterator) return;     // If already initialized, ignore (unit tests)
+    if (nameToIterator) return; // If already initialized, ignore (unit tests)
 
     nameToIterator = dictCreate(&sdsrefToPtrDictType);
     serverAssert(nameToIterator != NULL);
@@ -2326,7 +2333,7 @@ bool bgIteration_iterationActive(void) {
 
 
 // PUBLIC API
-void bgIteration_keyDelete(int dbid, const sds key) {
+void bgIteration_keyDelete(int dbid, const_sds key) {
     if (!bgIteration_iterationActive()) return;
     serverAssert(onValkeyMainThread());
 
@@ -2334,7 +2341,7 @@ void bgIteration_keyDelete(int dbid, const sds key) {
         debugBuffer = sdscatprintf(debugBuffer, "KEYDEL: (%d)%s\n", dbid, key);
     }
 
-    dbEntry *de = dbFind(server.db[dbid], key);
+    dbEntry *de = dbFind(server.db[dbid], (sds)key);
     if (de == NULL) return;
 
     // For consistent iterators, we need to make sure the item gets written before delete
@@ -2398,18 +2405,19 @@ bool bgIteration_blockClientIfRequired(client *c) {
     }
 
     bool mustBlock = false;
-    dict *waitOnKeys = dictCreate(&tempKeysetDictType);     // dict of robj(sds)->NULL
+    dict *waitOnKeys = dictCreate(&tempKeysetDictType); // dict of robj(sds)->NULL
     listEmpty(curCmdMissingKeys);
 
+    #define JHB_HACK_NO_BLOCKING
     if (c->cmd->proc == execCommand) {
         mustBlock = expediteKeysForMultiExec(c, waitOnKeys);
-        // JHB - HACK because no blocking yet
+        #ifdef JHB_HACK_NO_BLOCKING
         while (mustBlock) {
-            receiveItemsBackFromIterators(true);    // Blocking
+            receiveItemsBackFromIterators(true); // Blocking
             dictEmpty(waitOnKeys, NULL);
             mustBlock = expediteKeysForMultiExec(c, waitOnKeys);
         }
-        // JHB - END HACK
+        #endif
     } else {
         getKeysResult result;
         initGetKeysResult(&result);
@@ -2420,8 +2428,11 @@ bool bgIteration_blockClientIfRequired(client *c) {
                             c->db->id, c->cmd, c->argc, c->argv, keyrefs, numkeys, waitOnKeys);
             serverAssert(!(mustBlock && (c->flag.multi) && !(c->flag.script)));
 
-            //if (mustBlock && (c->flag.script)) {
-            if (mustBlock) { // JHB HACK - do this for everything because of missing blocking
+            #ifdef JHB_HACK_NO_BLOCKING
+            if (mustBlock) {
+            #else
+            if (mustBlock && (c->flag.script)) {
+            #endif
                 /* For scripts, we will block for keys declared in EVAL/EVALSHA/FCALL.
                  *  However, scripts are NOT required to declare keys.  Even if it declares keys,
                  *  it's not declaring the DB for the key.  After a SELECT or SWAPDB, we might be on
@@ -2429,7 +2440,7 @@ bool bgIteration_blockClientIfRequired(client *c) {
                  *  synchronous block and wait for the iterator(s) to be done with the key(s).
                  *  (Yuck.)  */
                 while (mustBlock) {
-                    receiveItemsBackFromIterators(true);    // Blocking
+                    receiveItemsBackFromIterators(true); // Blocking
                     dictEmpty(waitOnKeys, NULL);
                     mustBlock = expediteKeysForWriteOnAllIterators(
                                     c->db->id, c->cmd, c->argc, c->argv, keyrefs, numkeys, waitOnKeys);
@@ -2522,7 +2533,7 @@ void bgIteration_handleCommandReplication(
         //  on the key as it would be a duplicate key at that point.  So, instead, we will mark the
         //  newly created key as "early iterated".
         bool success = getDbIdFromRobj(argv[MOVE_COMMAND_DBID_ARG_INDEX], &special_dbid);
-        serverAssert(success);  // the command already succeeded, so this should work!
+        serverAssert(success); // the command already succeeded, so this should work!
 
         robj *oKey = argv[1];
         special_key = (sds)objectGetVal(oKey);
@@ -2532,7 +2543,7 @@ void bgIteration_handleCommandReplication(
     if (cmd->proc == copyCommand) {
         // The COPY command succeeded.  However COPY requires special handling (like MOVE).
         bool success = getTargetDbIdForCopyCommand(argc, argv, dbid, &special_dbid);
-        serverAssert(success);  // the command already succeeded, so this should work!
+        serverAssert(success); // the command already succeeded, so this should work!
 
         // Find the newly created entry.
         robj *oKey = argv[2];
@@ -2582,8 +2593,8 @@ void bgIteration_handleCommandReplication(
                 listRewind(curCmdMissingKeys, &missingIt);
                 while ((missingNode = listNext(&missingIt)) != NULL) {
                     robj *oKey = listNodeValue(missingNode);
-                    const sds key = objectGetVal(oKey);
-                    dbEntry *de = dbFind(server.db[dbid], key);
+                    const_sds key = objectGetVal(oKey);
+                    dbEntry *de = dbFind(server.db[dbid], (sds)key);
                     if (de != NULL) {
                         // It exists now!
                         if (it->cur_cmd_may_replicate

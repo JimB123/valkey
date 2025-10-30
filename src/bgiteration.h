@@ -291,7 +291,7 @@ bool bgIteration_iterationActive(void);
  * Since the dbEntry is a reference counted object, the dbEntry can't be physically deleted if
  * bgIteration is still actively using it.
  */
-void bgIteration_keyDelete(int dbid, const sds key);
+void bgIteration_keyDelete(int dbid, const_sds key);
 
 
 /* Iteration needs to know if a FLUSHALL is being performed.  For normal clients, this comes through

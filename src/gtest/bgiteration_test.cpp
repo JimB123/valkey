@@ -32,6 +32,8 @@ extern "C" {
     void createSharedObjects(void);
     void hashtableDump(hashtable *ht);
     void rehashStep(hashtable *ht); // in hashtable.c (non-API)
+    void bgIteration_unitTestDisableCloning(void);
+    void bgIteration_unitTestEnableCloning(int item_bytes, int pool_bytes);
 }
 
 
@@ -76,10 +78,11 @@ bool iteratorRepldoneFnNotBeingReadyInitially(void *privdata) {
 static const char *logfile = "";
 
 
-/* Most of the bgIteration unit tests are based on a CMD instance with 2 DBs.  There are 5 keys in
- * each DB.  The keys are named A0, B0, C0, D0, E0 for DB-0 and A1, B1, C1, D1, E1 for DB-1.
- * There are a number of helper functions to simulate certain key modification actions within
- * our test configuration.  Note that this is isolated from the actual call to processCommand.
+/* Most of the bgIteration unit tests are based on a CMD instance with 2 DBs.  There are 8 keys in
+ * each DB.  The keys are named A0, B0, C0, D0, E0, F0, G0, H0 for DB-0 and A1, B1, C1, D1, E1, F1,
+ * G1, H1 for DB-1.  There are a number of helper functions to simulate certain key modification
+ * actions within our test configuration.  Note that this is isolated from the actual call to
+ * processCommand.
  * 
  * Because most of bgIteration is based on an ordered processing of keys, it doesn't matter if we
  * are simulating CMD or CME, full scan, or slot-based.  The majority of tests are independent of
@@ -95,15 +98,16 @@ static const char *logfile = "";
 class BgIterationTest : public ::testing::Test {
     private:
         static const int DB_COUNT = 2;
-        static const int ITEMS_PER_DB = 5;
+        static const int ITEMS_PER_DB = 8;
 
-        // This is the expected order of the keys when hashed into:
-        //  DB-0:  dict size 8
-        //  DB-1:  dict size 8, rehashing to 16, 1 step
-        const char *keys[DB_COUNT][ITEMS_PER_DB] = {{"C0", "A0", "B0", "D0", "E0"},
-                                                    {"A1", "E1", "D1", "B1", "C1"}};
+        // This is the expected order of the keys when hashed
+        const char *keys[DB_COUNT][ITEMS_PER_DB] = {{"D0", "G0", "H0", "C0", "F0", "A0", "B0", "E0"},
+                                                    {"B1", "C1", "F1", "G1", "E1", "D1", "A1", "H1"}};
 
     protected:
+        static const int TOTAL_ITEMS = DB_COUNT * ITEMS_PER_DB;
+        static const int LAST_ITEM = TOTAL_ITEMS - 1;
+
         MockValkey mock;
         RealValkey real;
 
@@ -138,36 +142,6 @@ class BgIterationTest : public ::testing::Test {
             }
             return -1;
         }
-
-
-        // The bucketization should look like this.  Remember that DB-1 is in
-        //  the middle of a rehash, so it has 2 tables.
-        //
-        // DB: 0  SLOT: 0
-        // Table 0, used 5, exp 1, top-level buckets 2, child buckets 0
-        //   Bucket 0:0 level:0
-        //     0 h2 91, key "C0"
-        //   Bucket 0:1 level:0
-        //     0 h2 b8, key "A0"
-        //     1 h2 f5, key "B0"
-        //     2 h2 63, key "D0"
-        //     3 h2 13, key "E0"
-        // Table 1, used 0, exp -1, top-level buckets 0, child buckets 0
-        //
-        // DB: 1  SLOT: 0
-        // Table 0, used 2, exp 1, top-level buckets 2, child buckets 0
-        //   Bucket 0:0 level:0
-        //   Bucket 0:1 level:0
-        //     0 h2 36, key "A1"
-        //     1 h2 0c, key "E1"
-        // Table 1, used 3, exp 2, top-level buckets 4, child buckets 0
-        //   Bucket 1:0 level:0
-        //     0 h2 e9, key "D1"
-        //   Bucket 1:1 level:0
-        //   Bucket 1:2 level:0
-        //     0 h2 18, key "B1"
-        //     1 h2 fd, key "C1"
-        //   Bucket 1:3 level:0
 
 
         // Do some general initialization before starting the suite.  Normally, the tests are run in
@@ -207,8 +181,8 @@ class BgIterationTest : public ::testing::Test {
 
 
         void addKeyAndValObjsToDb(int dbid, sds key, sds val) {
-            robj *key_obj = createObject(OBJ_STRING, key);
-            robj *val_obj = createObject(OBJ_STRING, val);
+            robj *key_obj = createStringObjectFromSds(key);
+            robj *val_obj = createStringObjectFromSds(val);
             dbAdd(server.db[dbid], key_obj, &val_obj);
             decrRefCount(key_obj);
         }
@@ -233,31 +207,92 @@ class BgIterationTest : public ::testing::Test {
                 initializeServerDb(dbid);
             }
 
+            // With hashtable, it can be difficult to get our keys spread across different buckets.
+            //  Here we play with hashtable size and rehashing to get comfortable scenarios for testing.
+            // NOTE: If the hashtable bucketization changes, we'll need to evaluate the tests for
+            //       changes.  Since bgIteration processes a bucket at a time, we need to evaluate
+            //       all the tests when bucketization changes.
+            // As an alternative, we could mock all of the hashtable activity, but it's better if we
+            //  can use the real functionality as much as possible.
+
+            kvstoreExpand(server.db[0]->keys, 16, 0, NULL);
             addKeyToDb(0, "A0", "A0");
             addKeyToDb(0, "B0", "B0");
             addKeyToDb(0, "C0", "C0");
             addKeyToDb(0, "D0", "D0");
             addKeyToDb(0, "E0", "E0");
+            addKeyToDb(0, "F0", "F0");
+            addKeyToDb(0, "G0", "G0");
+            addKeyToDb(0, "H0", "H0");
+            hashtable *ht = kvstoreGetHashtable(server.db[1]->keys, 0);
+            hashtablePauseRehashing(ht);
 
+            kvstoreExpand(server.db[1]->keys, 16, 0, NULL);
             addKeyToDb(1, "A1", "A1");
             addKeyToDb(1, "B1", "B1");
             addKeyToDb(1, "C1", "C1");
             addKeyToDb(1, "D1", "D1");
             addKeyToDb(1, "E1", "E1");
-
+            addKeyToDb(1, "F1", "F1");
+            addKeyToDb(1, "G1", "G1");
+            addKeyToDb(1, "H1", "H1");
             // Now, let's increase the size and start a rehash on the 2nd DB.  This ensures that
-            //  iteration is working even if a hashtable is in the middle of rehashing.
-            kvstoreExpand(server.db[1]->keys, 16, 0, NULL);
-            hashtable *ht = kvstoreGetHashtable(server.db[1]->keys, 0);
+            //  iteration is working even if a hashtable is in the middle of rehashing.  We choose
+            //  a 128 size so that rehashed keys all get unique buckets.
+            kvstoreExpand(server.db[1]->keys, 128, 0, NULL);
+            ht = kvstoreGetHashtable(server.db[1]->keys, 0);
             rehashStep(ht); // in hashtable.c (non-API)
+            rehashStep(ht); // and rehash the 2nd bucket also
             hashtablePauseRehashing(ht);
 
+            // The bucketization should look like this.  Remember that DB-1 is in
+            //  the middle of a rehash, so it has 2 tables.
+            //
+            // DB: 0  SLOT: 0
+            // Table 0, used 8, exp 2, top-level buckets 4, child buckets 0
+            //   Bucket 0:1 level:0
+            //     0 h2 63, key "D0"
+            //     1 h2 a5, key "G0"
+            //     2 h2 ca, key "H0"
+            //   Bucket 0:2 level:0
+            //     0 h2 91, key "C0"
+            //     1 h2 88, key "F0"
+            //   Bucket 0:3 level:0
+            //     0 h2 b8, key "A0"
+            //     1 h2 f5, key "B0"
+            //     2 h2 13, key "E0"
+            // Table 1, used 0, exp -1, top-level buckets 0, child buckets 0
+            //
+            // DB: 1  SLOT: 0
+            // Table 0, used 3, exp 2, top-level buckets 4, child buckets 0
+            //   Bucket 0:0 level:0   <- rehashed into table 1
+            //   Bucket 0:1 level:0   <- rehashed into table 1
+            //   Bucket 0:2 level:0
+            //     0 h2 18, key "B1"
+            //     1 h2 fd, key "C1"
+            //   Bucket 0:3 level:0
+            //     0 h2 6f, key "F1"
+            // Table 1, used 5, exp 5, top-level buckets 32, child buckets 0
+            //   Bucket 1:1 level:0
+            //     0 h2 ad, key "G1"
+            //   Bucket 1:5 level:0
+            //     0 h2 0c, key "E1"
+            //   Bucket 1:12 level:0
+            //     0 h2 e9, key "D1"
+            //   Bucket 1:17 level:0
+            //     0 h2 36, key "A1"
+            //   Bucket 1:29 level:0
+            //     0 h2 9e, key "H1"
+            //   Bucket 1:30 level:0
+
+
             // In case we need to debug...
+            // Used to generate comment above, showing bucketization.
             if (0) debugPrintBucketInfo();
 
             // Validate that the iteration order matches the expected order
             for (int db = 0;  db < server.dbnum;  db++) {
-                hashtable *ht = kvstoreGetHashtable(server.db[db]->keys, 0);
+                ht = kvstoreGetHashtable(server.db[db]->keys, 0);
                 hashtableIterator *it = hashtableCreateIterator(ht, 0);
                 robj *next;
                 int i = 0;
@@ -274,9 +309,7 @@ class BgIterationTest : public ::testing::Test {
             server.forkless_options_supported = 1;
             objectSetMetadataSize(sizeof(bgIterationEntryMetadata));
 
-            // JHB - this is constant now?!  Do tests need this?
-            // server.amz.bgiteration_max_item_clone_size = 0;   // Most tests don't expect cloning
-            // server.amz.bgiteration_max_clone_pool_size = 0;   // Most tests don't expect cloning
+            bgIteration_unitTestDisableCloning();
 
             setupDatabase();
 
@@ -375,16 +408,12 @@ class BgIterationTest : public ::testing::Test {
 
 
         void expectDictEntryMetadataMatch(dbEntry *de1, dbEntry *de2) {
-            UNUSED(de1);UNUSED(de2);//JHB
-            // amzDbEntryMetadata *dm1 = static_cast<amzDbEntryMetadata *>(objectGetMetadata(de1));
-            // amzDbEntryMetadata *dm2 = static_cast<amzDbEntryMetadata *>(objectGetMetadata(de2));
+            bgIterationEntryMetadata *dm1 = static_cast<bgIterationEntryMetadata *>(objectGetMetadata(de1));
+            bgIterationEntryMetadata *dm2 = static_cast<bgIterationEntryMetadata *>(objectGetMetadata(de2));
 
-            // EXPECT_TRUE(dm1 != nullptr);
-            // EXPECT_TRUE(dm2 != nullptr);
-            // EXPECT_EQ(dm1->iterator_epoch, dm2->iterator_epoch);
-            // EXPECT_EQ(dm1->slot_number, dm2->slot_number);
-            // EXPECT_EQ(dm1->mutation_count, dm2->mutation_count);
-            // EXPECT_EQ(dm1->tag, dm2->tag);
+            EXPECT_NE(dm1, nullptr);
+            EXPECT_NE(dm2, nullptr);
+            EXPECT_EQ(dm1->iterator_epoch, dm2->iterator_epoch);
         }
 
 
@@ -426,6 +455,22 @@ class BgIterationTest : public ::testing::Test {
         }
 
 
+        // Make a copy of the metadata
+        void * cloneMetadata(dbEntry *de) {
+            int size = objectGetMetadataSize(de);
+            void *metadata = zmalloc(size);
+            memcpy(metadata, objectGetMetadata(de), size);
+            return metadata;
+        }
+
+
+        // Compare a previous metadata copy to an existing entry
+        void compareAndFreeClonedMetadata(dbEntry *de, void *metadata) {
+            EXPECT_EQ(memcmp(objectGetMetadata(de), metadata, objectGetMetadataSize(de)), 0);
+            zfree(metadata);
+        }
+
+
         // The test expects the next item will be a specific key
         //  The item value is verified against the default unless provided as a parameter.
         void expectReadKey(bgIterator *iter, int itemNum, const char *value=nullptr) {
@@ -437,12 +482,13 @@ class BgIterationTest : public ::testing::Test {
 
             ASSERT_EQ(item->type, BGITERATOR_ITEM_DBENTRY);
             EXPECT_EQ(item->dbid, db);
-            if (item->u.dbe.is_cloned) {
-                // If the entry is cloned, make sure we copied the metadata
-                dbEntry *cloned_dbEntry = item->u.dbe.de;
-                dbEntry *original_dbEntry = getItem(itemNum);
-                expectDictEntryMetadataMatch(original_dbEntry, cloned_dbEntry);
-            }
+            EXPECT_FALSE(item->u.dbe.is_cloned);
+            // if (item->u.dbe.is_cloned) {  // JHB - wrong place to check this.
+            //     // If the entry is cloned, make sure we copied the metadata
+            //     dbEntry *cloned_dbEntry = item->u.dbe.de;
+            //     dbEntry *original_dbEntry = getItem(itemNum);
+            //     expectDictEntryMetadataMatch(original_dbEntry, cloned_dbEntry);
+            // }
             EXPECT_STREQ(objectGetKey(item->u.dbe.de), keyStr(itemNum));
             if (value) {
                 EXPECT_THAT(item->u.dbe.de, robjEqualsStr(value));
@@ -452,19 +498,28 @@ class BgIterationTest : public ::testing::Test {
         }
 
 
-        // void expectReadKeyWithNullValue(bgIterator *iter, int itemNum) {
-        //     int db = getDbFromItemNum(itemNum);
+        // The test expects the next item will be a specific key amd that the item is cloned.
+        //  Metadata is tested (to make sure the clone includes the proper metadata).
+        //  The item value is verified against the default unless provided as a parameter.
+        void expectReadClonedKey(bgIterator *iter, int itemNum, void *metadata, const char *value=nullptr) {
+            int db = getDbFromItemNum(itemNum);
 
-        //     bgIteration_feedIterators();
-        //     bgIteratorItem *item = bgIteratorRead(iter);
-        //     bgIteration_feedIterators();
+            bgIteration_feedIterators();
+            bgIteratorItem *item = bgIteratorRead(iter);
+            bgIteration_feedIterators();
 
-        //     ASSERT_EQ(item->type, BGITERATOR_ITEM_DBENTRY);
-        //     EXPECT_EQ(item->dbid, db);
-        //     EXPECT_STREQ(objectGetKey(item->u.dbe.de), keyStr(itemNum));
+            ASSERT_EQ(item->type, BGITERATOR_ITEM_DBENTRY);
+            EXPECT_EQ(item->dbid, db);
+            EXPECT_TRUE(item->u.dbe.is_cloned);
+            compareAndFreeClonedMetadata(item->u.dbe.de, metadata);
+            EXPECT_STREQ(objectGetKey(item->u.dbe.de), keyStr(itemNum));
+            if (value) {
+                EXPECT_THAT(item->u.dbe.de, robjEqualsStr(value));
+            } else {
+                EXPECT_THAT(item->u.dbe.de, robjEqualsStr(keyStr(itemNum)));
+            }
+        }
 
-        //     EXPECT_TRUE(objectGetVal(item->u.dbe.de) == NULL);
-        // }
 
         // Test expects the next key, but specified by key name, not itemNum.
         void expectReadDbKeyValue(bgIterator *iter, int db, const char *key, const char *value) {
@@ -588,9 +643,9 @@ class BgIterationTest : public ::testing::Test {
 
             c->argc = 3;
             c->argv = static_cast<robj**>(zcalloc(sizeof(robj*) * c->argc));
-            c->argv[0] = createObject(OBJ_STRING, sdsnew(c->cmd->fullname));
-            c->argv[1] = createObject(OBJ_STRING, sdsnew(keyStr(itemNum)));
-            c->argv[2] = createObject(OBJ_STRING, sdsnew(value));
+            c->argv[0] = createStringObjectFromSds(sdsnew(c->cmd->fullname));
+            c->argv[1] = createStringObjectFromSds(sdsnew(keyStr(itemNum)));
+            c->argv[2] = createStringObjectFromSds(sdsnew(value));
 
             return c;
         }
@@ -598,9 +653,9 @@ class BgIterationTest : public ::testing::Test {
 
         // Create a client with a write command that touches multiple keys
         client * getWriteMultiKeysClient(
+                const char * cmdName,
                 int dstItemNum,
-                const std::vector<int> & srcItemsNum,
-                const char * cmdName = nullptr) {
+                const std::vector<int> & srcItemsNum) {
 
             assert(!srcItemsNum.empty());
 
@@ -611,30 +666,30 @@ class BgIterationTest : public ::testing::Test {
 
             client *c = static_cast<client*>(zcalloc(sizeof(client)));
 
-            c->cmd = lookupCommandByCString(cmdName ? cmdName : "sunionstore");
+            c->cmd = lookupCommandByCString(cmdName);
+            assert(c->cmd != nullptr);
             c->db = server.db[db];
 
             c->argc = 2 + srcItemsNum.size();
             c->argv = static_cast<robj**>(zcalloc(sizeof(robj*) * c->argc));
-            c->argv[0] = createObject(OBJ_STRING, sdsnew(c->cmd->fullname));
-            c->argv[1] = createObject(OBJ_STRING, sdsnew(keyStr(dstItemNum)));
+            c->argv[0] = createStringObjectFromSds(sdsnew(c->cmd->fullname));
+            c->argv[1] = createStringObjectFromSds(sdsnew(keyStr(dstItemNum)));
             for (unsigned int i = 0;  i < srcItemsNum.size();  i++) {
-                c->argv[2 + i] = createObject(OBJ_STRING, sdsnew(keyStr(srcItemsNum[i])));
+                c->argv[2 + i] = createStringObjectFromSds(sdsnew(keyStr(srcItemsNum[i])));
             }
 
             return c;
         }
 
 
-        client * getWrite2KeysClient(
-                int dstItemNum, int srcItemNum, const char * cmdName = nullptr) {
-            return getWriteMultiKeysClient(dstItemNum, {srcItemNum}, cmdName);
+        client * getWrite2KeysClient(const char * cmdName, int dstItemNum, int srcItemNum) {
+            return getWriteMultiKeysClient(cmdName, dstItemNum, {srcItemNum});
         }
 
 
         client * getWrite3KeysClient(
-                int dstItemNum, int src1ItemNum, int src2ItemNum, const char * cmdName = nullptr) {
-            return getWriteMultiKeysClient(dstItemNum, {src1ItemNum, src2ItemNum}, cmdName);
+                const char * cmdName, int dstItemNum, int src1ItemNum, int src2ItemNum) {
+            return getWriteMultiKeysClient(cmdName, dstItemNum, {src1ItemNum, src2ItemNum});
         }
 
 
@@ -675,7 +730,7 @@ class BgIterationTest : public ::testing::Test {
             c->cmd = lookupCommandByCString("exec");
             c->argc = 1;
             c->argv = static_cast<robj**>(zcalloc(sizeof(robj*) * c->argc));
-            c->argv[0] = createObject(OBJ_STRING, sdsnew("EXEC"));
+            c->argv[0] = createStringObjectFromSds(sdsnew("EXEC"));
 
             zfree(commandsCopy);
             return c;
@@ -721,10 +776,10 @@ class BgIterationTest : public ::testing::Test {
 
             c->argc = 4;
             c->argv = static_cast<robj**>(zcalloc(sizeof(robj*) * c->argc));
-            c->argv[0] = createObject(OBJ_STRING, sdsnew(cmd->fullname));
-            c->argv[1] = createObject(OBJ_STRING, sdsnew(keyStr(itemNum1)));
-            c->argv[2] = createObject(OBJ_STRING, sdsnew(value1));
-            c->argv[3] = createObject(OBJ_STRING, sdsnew(keyStr(itemNum2)));
+            c->argv[0] = createStringObjectFromSds(sdsnew(cmd->fullname));
+            c->argv[1] = createStringObjectFromSds(sdsnew(keyStr(itemNum1)));
+            c->argv[2] = createStringObjectFromSds(sdsnew(value1));
+            c->argv[3] = createStringObjectFromSds(sdsnew(keyStr(itemNum2)));
 
             return c;
         }
@@ -748,7 +803,7 @@ class BgIterationTest : public ::testing::Test {
 
             c->argc = 1;
             c->argv = static_cast<robj**>(zcalloc(sizeof(robj*) * c->argc));
-            c->argv[0] = createObject(OBJ_STRING, sdsnew(cmd->fullname));
+            c->argv[0] = createStringObjectFromSds(sdsnew(cmd->fullname));
 
             return c;
         }
@@ -781,14 +836,9 @@ class BgIterationTest : public ::testing::Test {
 
         // Simulate what happens when a write command is blocked
         void simulateBlockedWrite(client *c, int expectedNumberBlockedKeys = 1) {
-            // bool called_block = false;
-            // EXPECT_CALL(mock, amzBlockClientOnKeys(_,c,_,expectedNumberBlockedKeys))
-            //         .WillOnce(DoAll(Assign(&called_block, true), Return(0)));
-
             EXPECT_CALL(mock, amzBlockClientOnKeys(_,c,_,expectedNumberBlockedKeys)).WillOnce(Return(0));
             bool blocked = bgIteration_blockClientIfRequired(c);
             EXPECT_TRUE(blocked);
-            // EXPECT_TRUE(called_block);
         }
 
 
@@ -823,9 +873,10 @@ class BgIterationTest : public ::testing::Test {
         }           
 
 
-        // Simulates what happens when a write command (SET) actually executes.
-        //  This requires a scenario where we would NOT be blocked on the write.
-        void simulateActualWrite(client *c) {
+        // Simulates what happens when a write command (SET) actually executes.  This requires a
+        //  scenario where we would NOT be blocked on the write.  It actually alters the value of
+        //  the key and updates the metadata.
+        void simulateUnblockedWriteWithModification(client *c) {
             EXPECT_CALL(mock, amzBlockClientOnKeys(_,c,_,_)).Times(0);
             bool blocked = bgIteration_blockClientIfRequired(c);
             EXPECT_FALSE(blocked);
@@ -864,7 +915,7 @@ class BgIterationTest : public ::testing::Test {
                 // Replicate MULTI if this is the first instruction inside MULTI/EXEC
                 if (i == 0) {
                     robj *argv[1];
-                    argv[0] = createObject(OBJ_STRING, sdsnew("multi"));
+                    argv[0] = createStringObjectFromSds(sdsnew("multi"));
                     bgIteration_handleCommandReplication(c->db->id, lookupCommandByCString("multi"), 1, argv);
                     decrRefCount(argv[0]);
                 }
@@ -873,7 +924,7 @@ class BgIterationTest : public ::testing::Test {
 
             // Call handleCommandReplication for EXEC
             robj *argv[1];
-            argv[0] = createObject(OBJ_STRING, sdsnew("EXEC"));
+            argv[0] = createStringObjectFromSds(sdsnew("EXEC"));
             bgIteration_handleCommandReplication(c->db->id, lookupCommandByCString("exec"), 1, argv);
             server.in_exec = 0;
             decrRefCount(argv[0]);
@@ -882,19 +933,18 @@ class BgIterationTest : public ::testing::Test {
 
         // Simulate the expiration (active expiration) of a key.  This is independent of command execution.
         void simulateExpiration(int itemNum) {
-            int db = getDbFromItemNum(itemNum);
-            sds sdsKey = sdsnew(keyStr(itemNum));
-            dbEntry *de = dbFind(server.db[db], sdsKey);
-            ASSERT_NE(de, nullptr); // Should be there before expire
+            ASSERT_NE(getItem(itemNum), nullptr); // Should be there before expire
 
             // NOTE: This seems weird, but Valkey propagates the delete before actually expiring the
             //       key.  BgIterator expects this behavior and expects the key to exist when the
             //       DEL is received for propagation.
 
             // Send bgIteration the DEL
+            int db = getDbFromItemNum(itemNum);
+            sds sdsKey = sdsnew(keyStr(itemNum));
             robj *argv[2];
-            argv[0] = createObject(OBJ_STRING, sdsnew("DEL"));
-            argv[1] = createObject(OBJ_STRING, sdsdup(sdsKey));
+            argv[0] = createStringObjectFromSds(sdsnew("DEL"));
+            argv[1] = createStringObjectFromSds(sdsdup(sdsKey));
             serverCommand *cmd = lookupCommandByCString("DEL");
             bgIteration_handleCommandReplication(db, cmd, 2, argv);
             decrRefCount(argv[0]);
@@ -903,8 +953,7 @@ class BgIterationTest : public ::testing::Test {
             bgIteration_keyDelete(db, sdsKey);
             simpleDelItem(itemNum);     // Simulate the actual del
 
-            de = dbFind(server.db[db], sdsKey);
-            EXPECT_EQ(de, nullptr);
+            EXPECT_EQ(getItem(itemNum), nullptr);
             sdsfree(sdsKey);
         }
 
@@ -913,18 +962,34 @@ class BgIterationTest : public ::testing::Test {
         void simulateExpirationOfInuse(int itemNum) {
             // An inuse item will have a refcount > 1.  BgIteration should have incremented the
             //  refcount while it is inuse.
-            int db = getDbFromItemNum(itemNum);
-            sds sdsKey = sdsnew(keyStr(itemNum));
-            dbEntry *de = dbFind(server.db[db], sdsKey);
-            sdsfree(sdsKey);
-
+            dbEntry *de = getItem(itemNum);
             ASSERT_NE(de, nullptr); // Should be there before expire
+            EXPECT_TRUE(bgIteration_isEntryInuse(de));
             EXPECT_EQ(de->refcount, 2u);
 
             simulateExpiration(itemNum);
 
             // At this point, the item is removed from the DB, but still exists, and the refcount
             //  has been reduced to 1.  This allows a background thread to continue using the item.
+            EXPECT_EQ(de->refcount, 1u);
+        }
+
+
+        // Simulates an expiration, but the item is a future item which will be expedited.
+        void simulateExpirationWithExpedite(int itemNum) {
+            // An inuse item will have a refcount > 1.  BgIteration should have incremented the
+            //  refcount while it is inuse.
+            dbEntry *de = getItem(itemNum);
+            ASSERT_NE(de, nullptr); // Should be there before expire
+            EXPECT_FALSE(bgIteration_isEntryInuse(de)); // Not yet inuse
+            EXPECT_EQ(de->refcount, 1u);
+
+            simulateExpiration(itemNum);
+
+            // At this point, the item is removed from the DB, but still exists, and the refcount
+            //  has been reduced to 1.  This allows a background thread to continue using the item.
+            EXPECT_TRUE(bgIteration_isEntryInuse(de)); // It's inuse now
+            EXPECT_EQ(getItem(itemNum), nullptr);      // but it's not in the DB anymore
             EXPECT_EQ(de->refcount, 1u);
         }
 
@@ -940,11 +1005,11 @@ class BgIterationTest : public ::testing::Test {
 
             c->argc = 3;
             c->argv = static_cast<robj**>(zcalloc(sizeof(robj*) * c->argc));
-            c->argv[0] = createObject(OBJ_STRING, sdsnew(c->cmd->fullname));
+            c->argv[0] = createStringObjectFromSds(sdsnew(c->cmd->fullname));
             dbStr[0] = '0' + dbid0;
-            c->argv[1] = createObject(OBJ_STRING, sdsnew(dbStr));
+            c->argv[1] = createStringObjectFromSds(sdsnew(dbStr));
             dbStr[0] = '0' + dbid1;
-            c->argv[2] = createObject(OBJ_STRING, sdsnew(dbStr));
+            c->argv[2] = createStringObjectFromSds(sdsnew(dbStr));
 
             bool blocked = bgIteration_blockClientIfRequired(c);
             EXPECT_FALSE(blocked);  // SWAPDB should never block
@@ -974,7 +1039,7 @@ class BgIterationTest : public ::testing::Test {
 
             c->argc = 1;
             c->argv = static_cast<robj**>(zcalloc(sizeof(robj*) * c->argc));
-            c->argv[0] = createObject(OBJ_STRING, sdsnew(c->cmd->fullname));
+            c->argv[0] = createStringObjectFromSds(sdsnew(c->cmd->fullname));
 
             dbEntry *de_in_use = getItem(anInUseItem);
             EXPECT_EQ(de_in_use->refcount, 2u);
@@ -1066,13 +1131,13 @@ TEST_F(BgIterationTest, orderedIteration) {
     bgIterator *it = bgIteratorCreateFullScanIter("simple",
             0, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKeySequence(it, 0, 9);
+    expectReadKeySequence(it, 0, LAST_ITEM);
 
     // Quick status check.  At this point, item #9 hasn't been returned yet.
     bgIteratorStatus status;
     bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentries_queued, 10u);
-    EXPECT_EQ(status.dbentries_processed, 9u);
+    EXPECT_EQ(status.dbentries_queued, static_cast<unsigned int>(TOTAL_ITEMS));
+    EXPECT_EQ(status.dbentries_processed, static_cast<unsigned int>(TOTAL_ITEMS) - 1);
 
     expectReadComplete(it); // Returns item #9, and reads the completion item
 
@@ -1093,12 +1158,12 @@ TEST_F(BgIterationTest, twoOrderedIterations) {
 
     int it1Count = 0;
     int it2Count = 0;
-    while (it1Count < 10 || it2Count < 10) {
+    while (it1Count < TOTAL_ITEMS || it2Count < TOTAL_ITEMS) {
         // Randomly read from either iterator
         if ((rand() % 2) == 0) {
-            if (it1Count < 10) expectReadKey(it1, it1Count++, nullptr);
+            if (it1Count < TOTAL_ITEMS) expectReadKey(it1, it1Count++);
         } else {
-            if (it2Count < 10) expectReadKey(it2, it2Count++, nullptr);
+            if (it2Count < TOTAL_ITEMS) expectReadKey(it2, it2Count++);
         }
     }
 
@@ -1112,22 +1177,28 @@ TEST_F(BgIterationTest, twoOrderedIterations) {
 }
 
 
+/////////////////////////////////////////////////////
+// MODIFY A FUTURE ITEM
+// The next tests validate the basic pattern when a key, not yet iterated, is modified.
+// Each variation of iteration flags is tested.
+// Note that these tests execute without cloning (cloning is tested elsewhere).
+/////////////////////////////////////////////////////
+
 // Modify a future item, without replication or consistency.
-// Our expectation for this case is that the modification shouldn't be blocked, the item shouldn't
-//  be expedited, and we will see the modified item once the iterator reaches it.
+// Our expectation for this case is that the modification should proceed without blocking, the item
+//  shouldn't be expedited, and we will see the modified item once the iterator reaches it.
 TEST_F(BgIterationTest, modFutureItem_NoReplication_NoConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter", 0, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // At this point, key 0 is read.  Keys 1,2,3,4 are queued (they are all in the same bucket).
-    // If we fake a modification to key 5, we won't know if it's handled out of order.
-    // So we fake a modification to key 6
+    // At this point, key 0 is read.  Keys 1 & 2 are queued (they are all in the same bucket).
+    // Fake a modification to a later key so that we can see if it gets processed out of order.
     client *c = getWriteClient(6, "xxx");
 
     // We DONT expect the client to be blocked - not consistent
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // Now continue reading, 1, 2, 3, 4, 5
     expectReadKeySequence(it, 1, 5);
@@ -1136,7 +1207,7 @@ TEST_F(BgIterationTest, modFutureItem_NoReplication_NoConsistent) {
     expectReadKey(it, 6, "xxx");
 
     // Continue...
-    expectReadKeySequence(it, 7, 9);
+    expectReadKeySequence(it, 7, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
@@ -1152,51 +1223,48 @@ TEST_F(BgIterationTest, modFutureItem_NoReplication_YesConsistent) {
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // At this point, key 0 is read.  Keys 1,2,3,4 are queued (they are all in the same bucket).
-    // If we fake a modification to key 5, we won't know if it's handled out of order.
-    // So we fake a modification to key 6
+    // At this point, key 0 is read.  Keys 1 & 2 are queued (they are all in the same bucket).
+    // Fake a modification to a later key so that we can see if it gets processed out of order.
     client *c = getWriteClient(6, "xxx");
     // Since this is consistent, we will block the client, disallowing the write.
     simulateBlockedWrite(c);
 
     // On a consistent iterator, the event is expedited in-front of items already in queue!
     //  Read key 6 out of order.
-    expectReadKey(it, 6, nullptr);
+    expectReadKey(it, 6);
 
     // Now, when we read key 1, key 6 is released back to Valkey, and the client will be unblocked.
     expectReadKeyWithUnblock(it, 1, 6);
-    simulateActualWrite(c); // Now the write can proceed
+    simulateUnblockedWriteWithModification(c); // Now the write can proceed
 
     // Continue...
     expectReadKeySequence(it, 2, 5);
     // 6 has already been processed
-    expectReadKeySequence(it, 7, 9);
+    expectReadKeySequence(it, 7, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
-// JHB test isn't working because epoch isn't correct.  Need a temporary mechanism to keep a table of "touched" keys.
-//  return 0 unless touched.  return get_epoch if touched.
 
 
 // Modify a future item, with replication but without consistency.  (Like a Threadsave Full Sync operation)
-// Our expectation for this case is that the modification should not be blocked, as the mode is inconsistent.
-//  We don't expect replication, as we haven't reached the item yet.  We'll see the modified item later.
+// Our expectation for this case is that the modification should proceed without blocking, as the
+//  mode is inconsistent.  We don't expect replication, as we haven't reached the item yet.  We'll
+//  see the modified item later.
 TEST_F(BgIterationTest, modFutureItem_YesReplication_NoConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // At this point, key 0 is read.  Keys 1,2,3,4 are queued (they are all in the same bucket).
-    // If we fake a modification to key 5, we won't know if it's handled out of order.
-    // So we fake a modification to key 6
+    // At this point, key 0 is read.  Keys 1 & 2 are queued (they are all in the same bucket).
+    // Fake a modification to a later key so that we can see if it gets processed out of order.
     client *c = getWriteClient(6, "xxx");
 
     // We DONT expect the client to be blocked - not consistent
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // NOTE:  Since we haven't reached this item yet, and consistency is not required, there's no
     //        need to replicate this command.  So everything should wrap up just fine - we will see
@@ -1209,402 +1277,123 @@ TEST_F(BgIterationTest, modFutureItem_YesReplication_NoConsistent) {
     expectReadKey(it, 6, "xxx");
 
     // Continue...
-    expectReadKeySequence(it, 7, 9);
+    expectReadKeySequence(it, 7, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
-#endif
-#ifdef CODE_NOT_READY_YET
 
 
+// There's no current use case for CONSISTENT with REPLICATION.  It's included for completeness
+//  and to clarify the functionality of the design.  However, if this combination were to be used,
+//  it would be invalid in the presence of SWAPDB.
 TEST_F(BgIterationDeathTest, modFutureItem_YesReplication_YesConsistent_fail) {
     // Note:  This configuration (CONSISTENT with REPLICATION) is invalid unless in cluster mode.
-    //        The issue is that with multiple database support SWAPDB creates a problem.  How is it
+    //        The issue is that with multiple database supporting SWAPDB creates a problem.  How is it
     //        possible to maintain a CONSISTENT view with a SWAPDB impacting the values seen in the
-    //        replication stream?
+    //        replication stream?  (Cluster mode doesn't support SWAPDB, so no issue there.)
     EXPECT_DEATH(bgIteratorCreateFullScanIter("iter", BGITERATOR_FLAG_REPLICATION | BGITERATOR_FLAG_CONSISTENT,
-            NULL, NULL, NULL, NULL), "");
-}
-
-
-TEST_F(BgIterationTestCluster, modFutureItem_YesReplication_YesConsistent_cluster) {
-    // Cluster test.  REPLICATION + CONSISTENT only supported in cluster mode
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-            BGITERATOR_FLAG_REPLICATION | BGITERATOR_FLAG_CONSISTENT,
-            NULL, iteratorCleanupFn, PRIVDATA);
-    bgIteratorStatus status;
-
-    // For this test, don't read the 1st key - we only have 5 keys since not using DB[1]
-    bgIteration_feedIterators();    // Prime the feed - key 0 and 1 are now enqueued
-
-    // At this point, key 0, and 1 are queued.  Fake a modification to key 2 & 4 - two keys to ensure
-    //  that replication is ordered
-    client *c1 = getWriteClient(2, "xxx");
-    client *c2 = getWriteClient(4, "yyy");
-
-    // Since this is consistent, we will block the client, disallowing the write.
-    simulateBlockedWrite(c1);
-    simulateBlockedWrite(c2);
-
-    // On a consistent iterator, the event is expedited in-front of items already in queue!
-    //  Read keys 2&4 out of order.
-    expectReadKey(it, 2, nullptr);  // reading original/unmodified item
-
-    // This call is expected to unblock the client waiting on #2
-    expectReadKeyWithUnblock(it, 4, nullptr, 2);  // reading original/unmodified item
-    simulateActualWrite(c1);
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.replication_queued, 1u);
-    EXPECT_EQ(status.replication_processed, 0u);
-
-    // Now read items 0 and 1 - these were actually already queued before keys 1 & 4 were expedited.
-    // This call is expected to unblock the client waiting on #4
-    expectReadKeyWithUnblock(it, 0, nullptr, 4);
-    simulateActualWrite(c2);
-    expectReadKey(it, 1, nullptr);
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.replication_queued, 2u);
-    EXPECT_EQ(status.replication_processed, 0u);
-
-     // And now the 2 replications are queued
-    expectReadReplication(it, c1);
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.replication_queued, 2u);       // 1st replication still being processed
-    EXPECT_EQ(status.replication_processed, 0u);    //  (no change in these metrics yet)
-
-    expectReadReplication(it, c2);
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.replication_queued, 2u);
-    EXPECT_EQ(status.replication_processed, 1u);    // Done with 1st, processing 2nd
-
-     // Continue...
-    expectReadKey(it, 3, nullptr);
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.replication_queued, 2u);
-    EXPECT_EQ(status.replication_processed, 2u);    // Done processing both repl items
-    expectReadComplete(it);
-    freeTestClient(c1);
-    freeTestClient(c2);
-}
-
-
-TEST_F(BgIterationTest, expediteFutureItem_YesReplication_NoConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-                                      BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
-    // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
-
-    // Try to expedite the future key
-    bgIteration_ensureKeySentToIterators(1, sdsnew(keyStr(9)));
-
-    // Continue...
-    expectReadKeySequence(it, 1, 4);
-    expectReadKey(it, 9, nullptr);
-    expectReadKeySequence(it, 5, 8);
-    expectReadComplete(it);
-}
-
-TEST_F(BgIterationTest, expediteFutureItem_NoReplication_YesConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-                                      BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
-    // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
-
-    // Try to expedite the future key
-    bgIteration_ensureKeySentToIterators(1, sdsnew(keyStr(9)));
-
-    // Continue...
-    expectReadKey(it, 9, nullptr);
-    expectReadKeySequence(it, 1, 8);
-    expectReadComplete(it);
-}
-
-
-TEST_F(BgIterationTest, verifyClonedDictEntryMetadata) {
-    // Initialize cloning configurations.
-    server.amz.bgiteration_max_item_clone_size = 50;
-    server.amz.bgiteration_max_clone_pool_size = 100;
-
-    bgIteratorStatus status;
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-            BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
-
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_queued, 0u);
-
-    client *c = getWriteClient(0, "xxx");
-
-    // Modify metadata: set the mutation count to a fixed value.
-    dbEntry *de = getItem(0);
-    static_cast<amzDbEntryMetadata *>(objectGetMetadata(de))->slot_number = 42;
-    static_cast<amzDbEntryMetadata *>(objectGetMetadata(de))->mutation_count = 12;
-
-    // Clone the entry.
-    simulateClonedWrite(it, c);
-
-    // At this point, one cloned entry should be in the queue.
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_queued, 1u);
-
-    // Read the key. The cloned metadata should be verified within expectReadKey.
-    // The cloned entry should have the same mutation count as the original entry.
-    expectReadKey(it, 0, nullptr);
-    expectReadKeySequence(it, 1, 9);
-    expectReadComplete(it);
-    freeTestClient(c);
-}
-
-// TODO: https://issues.amazon.com/issues/ELMO-112296
-TEST_F(BgIterationTest, modFutureItem_NoReplication_YesConsistent_CloneExpeditedItem) {
-    // Initialize cloning configurations.
-    server.amz.bgiteration_max_item_clone_size = 50;
-    server.amz.bgiteration_max_clone_pool_size = 100;
-    bgIteratorStatus status;
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-            BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
-
-    // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
-
-    // At this point, key 0 is read.  Keys 1,2,3,4 are queued (they are all in the same bucket).
-    // If we fake a modification to key 5, we won't know if it's handled out of order.
-    // So we fake a modification to key 6 and 7.
-    client *c1 = getWriteClient(6, "xxx");
-    client *c2 = getWriteClient(7, "yyy");
-
-    // Test with a NULL value for key 7 to simulate an item that was spilled to disk by Tiered Storage.
-    dbEntry *de7 = getItem(7);
-    void *old_ptr = objectGetVal(de7);
-    objectSetVal(de7, NULL);
-
-    // Quick status check.  At this point, no clones exist yet.
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_queued, 0u);
-
-    // Since item 6 should be cloned, it will not block the client, allowing the write.
-    simulateClonedWrite(it, c1);
-
-    // At this point, one clone is in the queue.
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_queued, 1u);
-
-    // Since item 7 has a NULL value, it should not be cloned. It will block the client.
-    EXPECT_CALL(mock, amzBlockClientOnKeys(_,c2,_,_)).Times(1);
-    EXPECT_CALL(mock, amzPauseRehashing(_)).Times(AtLeast(1));
-    bool blocked = bgIteration_blockClientIfRequired(c2);
-    // Ensure client is blocked and no cloning took place, we still only have one clone in place.
-    EXPECT_TRUE(blocked);
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_queued, 1u);
-
-    // On a consistent iterator, the event is expedited in-front of items already in queue!
-    //  Read key 6 and 7 out of order.
-    expectReadKey(it, 6, nullptr);
-
-    // Quick status check.  At this point, cloned items have not been marked as processed yet.
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_processed, 0u);
-
-    // Read key 7, which has a NULL value.
-    // Reading the next item will release the previous one.
-    expectReadKeyWithNullValue(it, 7);
-
-    // Now, when we read key 7, key 6 is released back to valkey, and the clone is deallocated.
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_processed, 1u);
-
-    // Now, when we read key 1 should not have an impact on number of processed clones.
-    // We only call resume rehashing if we paused successfully on a hash
-    EXPECT_CALL(mock, amzResumeRehashing(_)).Times(0);
-    expectReadKey(it, 1, nullptr);
-    simulateActualWrite(c1);
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_processed, 1u);
-
-    expectReadKey(it, 2, nullptr);
-    simulateActualWrite(c2);
-
-    // Continue...
-    expectReadKeySequence(it, 3, 5);
-    // 6 and 7 have already been processed
-    expectReadKeySequence(it, 8, 9);
-    expectReadComplete(it);
-    freeTestClient(c1);
-    freeTestClient(c2);
-    objectSetVal(de7, old_ptr);
-}
-
-
-TEST_F(BgIterationTest, modFutureItem_NoReplication_YesConsistent_LargeItemOrClonePoolFull) {
-    // Initialize cloning configurations to test the clone pool functionality first.
-    server.amz.bgiteration_max_item_clone_size = 50;
-    server.amz.bgiteration_max_clone_pool_size = 50;
-    bgIteratorStatus status;
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-            BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
-
-    // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
-
-    // At this point, key 0 is read.  Keys 1,2,3,4 are queued (they are all in the same bucket).
-    // If we fake a modification to key 5, we won't know if it's handled out of order.
-    // So we fake a modification to key 6, 7, and 8.
-    client *c5 = getWriteClient(6, "xxx");
-    client *c6 = getWriteClient(7, "xxx");
-    client *c7 = getWriteClient(8, "xxx");
-
-    // Quick status check.  At this point, no clones exist yet.
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_queued, 0u);
-
-    // Since item 6 should be cloned, it will not block the client, allowing the write.
-    simulateClonedWrite(it, c5);
-
-    // At this point, one clone is in the queue.
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_queued, 1u);
-
-    // Now that cloning pool is full, item 6 will not be cloned and the client will be blocked.
-    simulateBlockedWrite(c6);
-
-    dbEntry *de6 = dbFind(c6->db, static_cast<sds>(objectGetVal(c6->argv[1])));
-    ASSERT_TRUE(bgIteration_isEntryInuse(de6));
-
-    // There is still only one cloned item in the queue.
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_queued, 1u);
-
-    // Now change cloning configurations to test that large items will not be cloned. We adjust
-    //  the clone pool size to allow two items, but set the maximum item size to be smaller than
-    //  the size of item 7. The clone pool size must be larger than the total size of the existing 
-    //  clones plus the maximum item clone size. 
-    server.amz.bgiteration_max_item_clone_size = 1;
-    server.amz.bgiteration_max_clone_pool_size = 101; 
-
-    // This write will pass the clone pool check but fail the item size check, blocking the client.
-    simulateBlockedWrite(c7);
-
-    dbEntry *de7 = dbFind(c7->db, static_cast<sds>(objectGetVal(c7->argv[1])));
-    ASSERT_TRUE(bgIteration_isEntryInuse(de7));
-
-    // On a consistent iterator, the event is expedited in-front of items already in queue!
-    //  Read key 6 out of order.
-    expectReadKey(it, 6, nullptr);
-
-    // Now, when we expect to read key 7, which was expedited, key 6 will be released back to Valkey
-    //  and the clone will be deallocated here.
-    expectReadKey(it, 7, nullptr);
-    simulateActualWrite(c5);
-
-    // Now, when we read key 8, which was expedited, key 7 is released back to Valkey, and the client 
-    // will be unblocked.
-    // (actually, unblock is called after every key [just in case] - but functionally we only care
-    //  about this one)
-    expectReadKeyWithUnblock(it, 8, nullptr, 7);
-    simulateActualWrite(c6);
-
-    // Now, when we read key 1, key 8 is released back to Valkey, and the client will be unblocked.
-    expectReadKeyWithUnblock(it, 1, nullptr, 8);
-    simulateActualWrite(c7);
-
-    // Since only one item was cloned, there should be one clone processed
-    bgIteratorGetStatus(it, &status);
-    EXPECT_EQ(status.dbentry_clones_processed, 1u);
-
-    // Continue...
-    expectReadKeySequence(it, 2, 5);
-    // 6, 7, and 8 have already been processed
-    expectReadKey(it, 9, nullptr);
-    expectReadComplete(it);
-    freeTestClient(c5);
-    freeTestClient(c6);
-    freeTestClient(c7);
+            NULL, NULL, NULL), "");
 }
 
 
 /////////////////////////////////////////////////////
 // MODIFY A CURRENT ITEM
+// The next tests validate the basic pattern when a key, currently in use, is modified.
+// Each variation of iteration flags is tested.
+// Note that these tests execute without cloning (cloning is tested elsewhere).
 /////////////////////////////////////////////////////
+
+// Modify a current item, without replication or consistency.
+// Our expectation for this case is that the modification SHOULD be blocked, the item shouldn't
+//  be expedited (it's already in use).
 TEST_F(BgIterationTest, modCurrentItem_NoReplication_NoConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter", 0, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // At this point, key 0 is read.  Keys 1,2,3 are queued (they are all in the same bucket).
+    // At this point, key 0 is read.  Keys 1 & 2 are queued (they are all in the same bucket).
     client *c = getWriteClient(2, "xxx");
 
     // Must be blocked since key is queued
     simulateBlockedWrite(c);
 
-    // Now continue reading, 1, 2, 3 were already in queue
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKeyWithUnblock(it, 3, nullptr, 2);
-    simulateActualWrite(c);     // the actual write won't affect anything (past key, no replication)
+    // Now continue reading
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
+    expectReadKeyWithUnblock(it, 3, 2);
+    simulateUnblockedWriteWithModification(c);     // the actual write won't affect anything (past key, no replication)
 
     // Continue...
-    expectReadKeySequence(it, 4, 9);
+    expectReadKeySequence(it, 4, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
 
+// Modify a current item, without replication but with consistency.  (Like a SAVE operation)
+// Our expectation for this case is that the modification SHOULD be blocked, the item shouldn't
+//  be expedited (it's already in use).
 TEST_F(BgIterationTest, modCurrentItem_NoReplication_YesConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // At this point, key 0 is read.  Keys 1,2,3 are queued (they are all in the same bucket).
+    // At this point, key 0 is read.  Keys 1 & 2 are queued (they are all in the same bucket).
     client *c = getWriteClient(2, "xxx");
 
     // Must be blocked since key is queued
     simulateBlockedWrite(c);
 
-    // Now continue reading, 1, 2, 3 were already in queue
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKeyWithUnblock(it, 3, nullptr, 2);
-    simulateActualWrite(c);     // the actual write won't affect anything (past key, no replication)
+    // Now continue reading
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
+    expectReadKeyWithUnblock(it, 3, 2);
+    simulateUnblockedWriteWithModification(c);     // the actual write won't affect anything (past key, no replication)
 
     // Continue...
-    expectReadKeySequence(it, 4, 9);
+    expectReadKeySequence(it, 4, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
+
+// Modify a current item, with replication but without consistency.  (Like a Threadsave Full Sync operation)
+// Our expectation for this case is that the modification SHOULD be blocked.  After the key is processed,
+//  the write will proceed, and the replication will be sent.
 TEST_F(BgIterationTest, modCurrentItem_YesReplication_NoConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // At this point, key 0 is read.  Keys 1,2,3 are queued (they are all in the same bucket).
+    // At this point, key 0 is read.  Keys 1 & 2 are queued (they are all in the same bucket).
     client *c = getWriteClient(2, "xxx");
 
     // Must be blocked since key is queued
     simulateBlockedWrite(c);
 
-    // Now continue reading, 1, 2, 3 were already in queue
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKeyWithUnblock(it, 3, nullptr, 2);
-    simulateActualWrite(c);     // the actual write will cause replication
+    // Now continue reading
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
+    expectReadKeyWithUnblock(it, 3, 2);
+    simulateUnblockedWriteWithModification(c);     // the actual write will cause replication
 
-    expectReadKey(it, 4, nullptr);  // 4 got put in queue when 3 was read
+    expectReadKey(it, 4);  // 4 got put in queue when 3 was read
 
     expectReadReplication(it, c);
 
     // Continue...
-    expectReadKeySequence(it, 5, 9);
+    expectReadKeySequence(it, 5, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 
-
+#ifdef CODE_NOT_READY_YET
 TEST_F(BgIterationTestCluster, modCurrentItem_YesReplication_YesConsistent_cluster) {
     // Cluster test.  REPLICATION + CONSISTENT only supported in cluster mode
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
@@ -1612,7 +1401,7 @@ TEST_F(BgIterationTestCluster, modCurrentItem_YesReplication_YesConsistent_clust
             NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // At this point, key 0 is read. All other keys are queued.
     client *c = getWriteClient(1, "xxx");
@@ -1621,124 +1410,105 @@ TEST_F(BgIterationTestCluster, modCurrentItem_YesReplication_YesConsistent_clust
     simulateBlockedWrite(c);
 
     // Not expedited because item is already in queue
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
     expectReadKeyWithUnblock(it, 2, nullptr, 1);  // reading original/unmodified item
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
-    expectReadKey(it, 3, nullptr);  // 2, 3 & 4 are in the same bucket, so the replication comes after
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 3);  // 2, 3 & 4 are in the same bucket, so the replication comes after
+    expectReadKey(it, 4);
     expectReadReplication(it, c);
 
      // Continue...
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 
-
-TEST_F(BgIterationTest, expediteCurrentItem_YesReplication_NoConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-                                      BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
-    // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
-
-    // This read returns key 0 (making it a past item)
-    expectReadKey(it, 1, nullptr);
-
-    // Try to expedite the past key
-    bgIteration_ensureKeySentToIterators(0, sdsnew(keyStr(2)));
-
-    // Continue...
-    expectReadKeySequence(it, 2, 9);
-    expectReadComplete(it);
-}
-
-TEST_F(BgIterationTest, expediteCurrentItem_NoReplication_YesConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-                                      BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
-    // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
-
-    // This read returns key 0 (making it a past item)
-    expectReadKey(it, 1, nullptr);
-
-    // Try to expedite the past key
-    bgIteration_ensureKeySentToIterators(0, sdsnew(keyStr(2)));
-
-    // Continue...
-    expectReadKeySequence(it, 2, 9);
-    expectReadComplete(it);
-}
+#ifdef CODE_NOT_READY_YET
 
 /////////////////////////////////////////////////////
 // MODIFY A PAST ITEM
+// The next tests validate the basic pattern when a key, not yet iterated on, is modified.
+// Each variation of iteration flags is tested.
+// Note that these tests execute without cloning (cloning is tested elsewhere).
 /////////////////////////////////////////////////////
 
+// Modify a past item, without replication or consistency.
+// Our expectation for this case is that the modification should proceed without blocking.
+//  No replication is generated and keys are processed similar to no modification.
 TEST_F(BgIterationTest, modPastItem_NoReplication_NoConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter", 0, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // This read returns key 0 (making it a past item)
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // At this point, key 0 is returned.
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // Continue...
-    expectReadKeySequence(it, 2, 9);
+    expectReadKeySequence(it, 2, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
 
+// Modify a past item, without replication but with consistency.  (Like a SAVE operation)
+// Our expectation for this case is that the modification should proceed without blocking.
+//  No replication is generated and keys are processed similar to no modification.
 TEST_F(BgIterationTest, modPastItem_NoReplication_YesConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // This read returns key 0 (making it a past item)
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // At this point, key 0 is returned.
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // Continue...
-    expectReadKeySequence(it, 2, 9);
+    expectReadKeySequence(it, 2, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
 
+// Modify a past item, with replication but without consistency.  (Like a Threadsave Full Sync operation)
+// Our expectation for this case is that the modification should proceed without blocking.
+//  Replication will be sent.
 TEST_F(BgIterationTest, modPastItem_YesReplication_NoConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // This read returns key 0 (making it a past item)
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // At this point, key 0 is returned.
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
-    // Keys 2, 3 & 4 were already in queue (same bucket as key 1).  The replication will follow.
-    expectReadKeySequence(it, 2, 4);
+    // Key 2 was already in queue (same bucket as key 1).  The replication will follow.
+    expectReadKey(it, 2);
     expectReadReplication(it, c);
 
     // Continue...
-    expectReadKeySequence(it, 5, 9);
+    expectReadKeySequence(it, 3, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 
-
+#ifdef CODE_NOT_READY_YET
 TEST_F(BgIterationTestCluster, modPastItem_YesReplication_YesConsistent_cluster) {
     // Cluster test.  REPLICATION + CONSISTENT only supported in cluster mode
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
@@ -1746,294 +1516,447 @@ TEST_F(BgIterationTestCluster, modPastItem_YesReplication_YesConsistent_cluster)
             NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // This read returns key 0 (making it a past item)
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // At this point, key 0 is returned.
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // Keys 2, 3, and 4 were already in queue.  The replication will follow.
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 2);
+    expectReadKey(it, 3);
+    expectReadKey(it, 4);
     expectReadReplication(it, c);
 
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 
 
-TEST_F(BgIterationTest, expeditePastItem_YesReplication_NoConsistent) {
+/////////////////////////////////////////////////////
+// TESTS FOR ITEM CLONING
+/////////////////////////////////////////////////////
+#ifdef CODE_NOT_READY_YET
+
+// In a consistent iteration, verify that a simple string is properly cloned, and that a write can
+//  occur without blocking.  Validate the cloned item and metadata.
+TEST_F(BgIterationTest, modFutureItem_NoReplication_YesConsistent_CloneExpeditedItem) {
+    // Initialize cloning configurations.
+    bgIteration_unitTestEnableCloning(50, 100);
+
+    bgIteratorStatus status;
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
-                                      BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
+            BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
+
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // This read returns key 0 (making it a past item)
-    expectReadKey(it, 1, nullptr);
+    // At this point, key 0 is read.  Keys 1 & 2 are queued (they are all in the same bucket).
+    // Fake a modification to a later key so that we can see if it gets processed out of order.
+    client *c = getWriteClient(6, "xxx");
 
-    // Try to expedite the past key
-    bgIteration_ensureKeySentToIterators(0, sdsnew(keyStr(0)));
+    // Quick status check.  At this point, no clones exist yet.
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_queued, 0u);
+
+    // Since item 6 should be cloned, it will not block the client, allowing the write.
+    void *de6_md = cloneMetadata(getItem(6));
+    simulateClonedWrite(it, c); // This wouldn't block, and queues the cloned value
+    simulateUnblockedWriteWithModification(c); // This modifies the real entry in the de (touching metadata)
+
+    // At this point, one clone is in the queue.
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_queued, 1u);
+
+    // On a consistent iterator, the event is expedited in-front of items already in queue!
+    //  Read key 6 (which is cloned) out of order.  The value will still match the key.
+    expectReadClonedKey(it, 6, de6_md); // Also validates and frees the metadata
+
+    // Quick status check.  At this point, cloned items have not been marked as processed yet.
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_processed, 0u);
+
+    // Reading key 1 will release key 6, and the clone will finish processing.
+    expectReadKey(it, 1);
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_processed, 1u);
+
+    // Now, when we read key 2 should not have an impact on number of processed clones.
+    expectReadKey(it, 2);
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_processed, 1u);
 
     // Continue...
-    expectReadKeySequence(it, 2, 9);
+    expectReadKeySequence(it, 3, 5);
+    // 6 has already been processed
+    expectReadKeySequence(it, 7, LAST_ITEM);
     expectReadComplete(it);
+    freeTestClient(c);
 }
 
-TEST_F(BgIterationTest, expeditePastItem_NoReplication_YesConsistent) {
+
+// Check that cloning for simple strings is respecting the size limits and pool size.  On a
+//  consistent iteration, we expect to block or clone on all future keys.  We validate that we can
+//  clone if the item is small enough and the cloning pool has more space left.
+TEST_F(BgIterationTest, modFutureItem_NoReplication_YesConsistent_LargeItemOrClonePoolFull) {
+    // Initialize cloning configurations to test the clone pool functionality first.
+    bgIteration_unitTestEnableCloning(50, 50);
+
+    bgIteratorStatus status;
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
-                                      BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
+            BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
+
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // This read returns key 0 (making it a past item)
-    expectReadKey(it, 1, nullptr);
+    // At this point, key 0 is read.  Keys 1 & 2 are queued (they are all in the same bucket).
+    // Fake a modification to a later key so that we can see if it gets processed out of order.
+    client *c6 = getWriteClient(6, "xxx");
+    client *c7 = getWriteClient(7, "xxx");
+    client *c8 = getWriteClient(8, "xxx");
 
-    // Try to expedite the past key
-    bgIteration_ensureKeySentToIterators(0, sdsnew(keyStr(0)));
+    // Quick status check.  At this point, no clones exist yet.
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_queued, 0u);
+
+    // Since item 6 should be cloned, it will not block the client, allowing the write.
+    void *de6_md = cloneMetadata(getItem(6));
+    simulateClonedWrite(it, c6);
+    simulateUnblockedWriteWithModification(c6);
+
+    // At this point, one clone is in the queue.
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_queued, 1u);
+
+    // Now that cloning pool is full, item 7 will not be cloned and the client will be blocked.
+    simulateBlockedWrite(c7);
+    ASSERT_TRUE(bgIteration_isEntryInuse(getItem(7)));
+
+    // There is still only one cloned item in the queue.
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_queued, 1u);
+
+    // Now change cloning configurations to test that large items will not be cloned. We adjust
+    //  the clone pool size to allow two items, but set the maximum item size to be smaller than
+    //  the size of item 8. The clone pool size must be larger than the total size of the existing 
+    //  clones plus the maximum item clone size. 
+    bgIteration_unitTestEnableCloning(1, 101);
+
+    // This write will pass the clone pool check but fail the item size check, blocking the client.
+    simulateBlockedWrite(c8);
+    ASSERT_TRUE(bgIteration_isEntryInuse(getItem(8)));
+
+    // On a consistent iterator, the expedited item in-front of items already in queue!
+    //  Read key 6 out of order.
+    expectReadClonedKey(it, 6, de6_md);
+
+    // Now, when we expect to read key 7, which was expedited, key 6 will be released back to Valkey
+    //  and the clone will be deallocated here.
+    expectReadKey(it, 7);
+
+    // Now, when we read key 8, which was expedited, key 7 is released back to Valkey, and the client 
+    // will be unblocked.
+    // (actually, unblock is called after every key [just in case] - but functionally we only care
+    //  about this one)
+    expectReadKeyWithUnblock(it, 8, 7);
+    simulateUnblockedWriteWithModification(c7);
+
+    // Now, when we read key 1, key 8 is released back to Valkey, and the client will be unblocked.
+    expectReadKeyWithUnblock(it, 1, 8);
+    simulateUnblockedWriteWithModification(c8);
+
+    // Since only one item was cloned, there should be one clone processed
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.dbentry_clones_processed, 1u);
 
     // Continue...
-    expectReadKeySequence(it, 2, 9);
+    expectReadKeySequence(it, 2, 5);
+    // 6, 7, and 8 have already been processed
+    expectReadKeySequence(it, 9, LAST_ITEM);
     expectReadComplete(it);
+    freeTestClient(c6);
+    freeTestClient(c7);
+    freeTestClient(c8);
 }
 
-// Special case:  Replication enabled, but NOT consistent.  In this case, if ANY of the keys have
-//                been iterated, ALL of the keys must be replicated so that the command can be
-//                processed properly on the replica.
+
+/////////////////////////////////////////////////////
+// TESTS RELATED TO MODIFICATION OF TWO ITEMS
+// When 2 keys are modified, we need to ensure that both keys have been sent before we can send
+//  replication.  This means that if replication is present, we may have to block/expedite for
+//  future keys, even in the inconsistent scenario.
+/////////////////////////////////////////////////////
+
+// Replication enabled, but NOT consistent.  In this case, if ANY of the keys have been iterated,
+//  ALL of the keys must be replicated so that the command can be processed properly on the replica.
 TEST_F(BgIterationTest, modPastFutureItem_YesReplication_NoConsistent) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
+    // In this test, we need a past and future key IN THE SAME DB (they're used in the same command).
+    //  DB1 has lots of buckets.  After reading item 9,
+    //    8 will be past, 10 will be in queue, 11-15 will be future.
+    expectReadKeySequence(it, 0, 9);
 
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);
-
-    // At this point, we are done with 0.  Keys 2 & 3 are left in queue.
-
-    client *c = getSetGetClient(0, "xxx", 4);
-
-    // Even though key 4 is for READ in this command, it must be expedited for replication
+    // We're going to write to key 8 (past) and read from key 12 (future)
+    // Even though key 12 is for READ in this command, it must be expedited so that it exists before
+    //  the associated replication is sent.
+    client *c = getSetGetClient(8, "xxx", 12);
     simulateBlockedWrite(c);
-    // Key 4 will be expedited, but not in front of existing items in queue (can only do that for
-    //  consistent iterators)
 
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
-    expectReadKey(it, 4, nullptr);
-    expectReadKeyWithUnblock(it, 5, nullptr, 4);
+    // Key 12 will be expedited, but not in front of existing items in queue (can only do that for
+    //  consistent iterators) - JHB How about cluster mode?
 
-    simulateActualWrite(c);
+    expectReadKey(it, 10);
+    expectReadKey(it, 12); // expedited
+    expectReadKeyWithUnblock(it, 11, 12); // 13 is now in queue
+
+    simulateUnblockedWriteWithModification(c);
 
     // Continue...
-    expectReadKey(it, 6, nullptr);
-    expectReadKey(it, 7, nullptr);  // same hash bucket as 6
+    expectReadKey(it, 13);
     expectReadReplication(it, c);
 
-    expectReadKey(it, 8, nullptr);
-    expectReadKey(it, 9, nullptr);
-
+    expectReadKeySequence(it, 14, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
-// Special case:  Replication NOT enabled.  A read-only key doesn't need to be expedited, even if
-//                other keys have been processed already.  (This should work identically for both
-//                consistent/non-consistent.
+
+// Replication NOT enabled.  A read-only key doesn't need to be expedited, even if other keys have
+//  been processed already.  (This should work identically for both consistent/non-consistent.
 TEST_F(BgIterationTest, modPastFutureItem_NoReplication_YesConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
+    bgIterator *it = bgIteratorCreateFullScanIter("iter1",
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);
+    // In this test, we need a past and future key IN THE SAME DB (they're used in the same command).
+    //  DB1 has lots of buckets.  After reading item 9,
+    //    8 will be past, 10 will be in queue, 11-15 will be future.
+    expectReadKeySequence(it, 0, 9);
 
-    // At this point, we are done with 0.  Keys 2 & 3 are left in queue.
+    // We're going to write to key 8 (past) and read from key 12 (future)
+    // Since there's no replication, we don't have to worry about expediting 12.  The write will
+    //  proceed without blocking.
+    client *c = getSetGetClient(8, "xxx", 12);
+    simulateUnblockedWriteWithModification(c);
 
-    client *c = getSetGetClient(0, "xxx", 4);
-
-    // Key 0 has already been processed.  Key 4 is a read only key.
-    //  Since replication is disabled, no need to block.
-    simulateActualWrite(c);
-
-    // Continue...
-    expectReadKeySequence(it, 2, 9);
+    // Key 12 will not be expedited.  Remaining keys should be received in normal order.
+    expectReadKeySequence(it, 10, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
-
 
 TEST_F(BgIterationTest, modPastFutureItem_NoReplication_NoConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
+    bgIterator *it = bgIteratorCreateFullScanIter("iter2",
             0, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);
+    // In this test, we need a past and future key IN THE SAME DB (they're used in the same command).
+    //  DB1 has lots of buckets.  After reading item 9,
+    //    8 will be past, 10 will be in queue, 11-15 will be future.
+    expectReadKeySequence(it, 0, 9);
 
-    // At this point, we are done with 0.  Keys 2 & 3 are left in queue.
+    // We're going to write to key 8 (past) and read from key 12 (future)
+    // Since there's no replication, we don't have to worry about expediting 12.  The write will
+    //  proceed without blocking.
+    client *c = getSetGetClient(8, "xxx", 12);
+    simulateUnblockedWriteWithModification(c);
 
-    client *c = getSetGetClient(0, "xxx", 4);
-
-    // Key 0 has already been processed.  Key 4 is a read only key.
-    //  Since replication is disabled, no need to block.
-    simulateActualWrite(c);
-
-    // Continue...
-    expectReadKeySequence(it, 2, 9);
+    // Key 9 will not be expedited.  Remaining keys should be received in normal order.
+    expectReadKeySequence(it, 10, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
 
-// Check for writes to missing keys.
-//  no-repl, no-consist:  past item skipped - future item skipped
-//  no-repl, yes-consist:  past item skipped - future item ignored
-//  yes-repl, no-consist:  past item skipped, but replicated - future item skipped, but replicated
-//  yes-repl, yes-consist:  past item skipped, but replicated - future item skipped but replicated
-// (Never blocking on a non-existent item.)
+/////////////////////////////////////////////////////
+// TESTS RELATED TO MISSING ITEMS
+// Missing items are tricky.  A missing item might be logically located in the past or future, in
+//  relation to the current iteration position.  The command may (or may not) create the "missing"
+//  key.  Some general considerations:
+//    * In a consistent iteration, a missing key didn't exist at the time of consistency, or it was
+//      already processed (saved) at the time of the deletion.  If the missing key gets created, we
+//      must be sure to skip it if we later iterate over it.
+//    * In a non-consistent iteration with replication:
+//        * If the key location is already passed, the replication is sent, allowing the key to be
+//          created (or not) based on the replication.
+//        * If the key location is in the furure, we can allow the command to proceed, without
+//          replication.  If the key is created, we will process it when the iterator gets to it.
+//
+// We expect:
+//  no-repl, no-consist:  past items are ignored - future items are processed when iterated
+//  no-repl, yes-consist:  past items are ignored - future items are ignored
+//  yes-repl, no-consist:  past item skipped, but replicated - future items are created by replication and skipped later
+//  yes-repl, yes-consist:  past item skipped, but replicated - future items are processed when iterated
+/////////////////////////////////////////////////////
+
+// no-repl, no-consist: creation of PAST item has no impact
 TEST_F(BgIterationTest, missingPastItem_NoReplication_NoConsistent) {
-    simpleDelItem(0);
+    simpleDelItem(0); // Delete the item before iterator creation
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             0, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
 
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
-    expectReadKeySequence(it, 3, 9);
+    expectReadKeySequence(it, 3, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
+
+// no-repl, yes-consist: creation of PAST item has no impact
 TEST_F(BgIterationTest, missingPastItem_NoReplication_YesConsistent) {
-    simpleDelItem(0);
+    simpleDelItem(0); // Delete the item before iterator creation
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
 
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
-    expectReadKeySequence(it, 3, 9);
+    expectReadKeySequence(it, 3, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
+
+// yes-repl, no-consist: creation of a PAST item will be replicated
 TEST_F(BgIterationTest, missingPastItem_YesReplication_NoConsistent) {
-    simpleDelItem(0);
+    simpleDelItem(0); // Delete the item before iterator creation
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
+    expectReadKey(it, 3);
 
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);     // replication will be added after item 3 (1,2,3,4 in same bucket)
+    simulateUnblockedWriteWithModification(c); // replication will be added after item 4 (3,4 in same bucket)
 
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 4);
 
     expectReadReplication(it, c);
 
-    expectReadKeySequence(it, 5, 9);
+    expectReadKeySequence(it, 5, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 
+#ifdef CODE_NOT_READY_YET
+// yes-repl, yes-consist: creation of a PAST item will be replicated
 TEST_F(BgIterationTestCluster, missingPastItem_YesReplication_YesConsistent) {
     // Cluster test.  REPLICATION + CONSISTENT only supported in cluster mode
-    simpleDelItem(0);
+    simpleDelItem(0); // Delete the item before iterator creation
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION | BGITERATOR_FLAG_CONSISTENT,
             NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
 
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);     // replication will be added after item 4 (2, 3, and 4 in same bucket)
+    simulateUnblockedWriteWithModification(c);     // replication will be added after item 4 (2, 3, and 4 in same bucket)
 
-    expectReadKey(it, 3, nullptr);
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 3);
+    expectReadKey(it, 4);
     expectReadReplication(it, c);
 
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 
-// and the same tests for a future key...
+#ifdef CODE_NOT_READY_YET
+
+// no-repl, no-consist: creation of FUTURE item is seen when reached by the iteration.
 TEST_F(BgIterationTest, missingFutureItem_NoReplication_NoConsistent) {
-    simpleDelItem(5);
+    // Using DB1 so we have lots of buckets
+    // Note:  Choosing item 14 because it's in the portion of DB1 that's already rehashed.  So we
+    //  know that the item won't be moving when we re-add it.
+    simpleDelItem(14); // Delete the item before iterator creation
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             0, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     const char * newValue = "xxx";
-    client *c = getWriteClient(5, newValue);
-    simulateActualWrite(c);
+    client *c = getWriteClient(14, newValue);
+    simulateUnblockedWriteWithModification(c);
 
-    expectReadKeySequence(it, 1, 4);
+    expectReadKeySequence(it, 1, 13);
 
-    // We expect to see item 5.
+    // We expect to see item 14.
     //  Note that for an inconsistent DB view, it is logically undefined if this value is seen (or not).
     //  But as implemented, we should see it and the test is helpful to understand if/when the
     //  functionality changes.
-    expectReadKey(it, 5, newValue);
+    expectReadKey(it, 14, newValue);
 
-    expectReadKeySequence(it, 6, 9);
+    expectReadKey(it, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
+
+// no-repl, yes-consist: creation of FUTURE item is ignored by consistent iteration.
 TEST_F(BgIterationTest, missingFutureItem_NoReplication_YesConsistent) {
-    simpleDelItem(4);
+    // Using DB1 so we have lots of buckets
+    // Note:  Choosing item 14 because it's in the portion of DB1 that's already rehashed.  So we
+    //  know that the item won't be moving when we re-add it.
+    simpleDelItem(14); // Delete the item before iterator creation
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    client *c = getWriteClient(4, "xxx");
-    simulateActualWrite(c);
+    client *c = getWriteClient(14, "xxx");
+    simulateUnblockedWriteWithModification(c);
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
-    // Key 4 is missing - it didn't exist at start of consistent iteration
-    expectReadKeySequence(it, 5, 9);
+    expectReadKeySequence(it, 1, 13);
+    // Key 14 is missing - it didn't exist at start of consistent iteration
+    expectReadKey(it, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
 
+// yes-repl, no-consist: creation of FUTURE item is handled by the replication, and then the key is
+//  later skipped (treated like an early iteration case).
 TEST_F(BgIterationTest, missingFutureItem_YesReplication_NoConsistent) {
-    simpleDelItem(4);
+    // Using DB1 so we have lots of buckets
+    // Note:  Choosing item 14 because it's in the portion of DB1 that's already rehashed.  So we
+    //  know that the item won't be moving when we re-add it.
+    simpleDelItem(14); // Delete the item before iterator creation
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0); // Items 1 & 2 are in queue (same bucket)
 
-    client *c = getWriteClient(4, "xxx");
-    simulateActualWrite(c);
+    client *c = getWriteClient(14, "xxx");
+    simulateUnblockedWriteWithModification(c);
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
+    expectReadKeySequence(it, 1, 2);
 
-    expectReadReplication(it, c);
+    expectReadReplication(it, c); // Here's the replication creating item 14
 
-    // The replication was read - we don't want to see the key now - #4 should be skipped
-
-    expectReadKeySequence(it, 5, 9);
+    expectReadKeySequence(it, 3, 13);
+    // We expect item 14 to be skipped, because it was created by the earlier replication
+    expectReadKey(it, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 
+#ifdef CODE_NOT_READY_YET
 TEST_F(BgIterationTestCluster, missingFutureItem_YesReplication_YesConsistent) {
     // Cluster test.  REPLICATION + CONSISTENT only supported in cluster mode
     simpleDelItem(4);
@@ -2044,46 +1967,194 @@ TEST_F(BgIterationTestCluster, missingFutureItem_YesReplication_YesConsistent) {
     bgIteration_feedIterators();    // Make sure we get key 0 and 1 into the queue
 
     client *c = getWriteClient(4, "xxx");
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 0);
+    expectReadKey(it, 1);
 
     expectReadReplication(it, c);
 
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
+    expectReadKey(it, 2);
+    expectReadKey(it, 3);
 
     // The replication was read - we don't want to see the key now - #4 should be skipped
 
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 
-// Test early termination
+// JHB - this is where I stopped.
+
+/////////////////////////////////////////////////////
+// TESTS RELATED TO EXPIRATION
+// Expiration can be tricky.  When pre-evaluating a command with bgIteration_blockClientIfRequired,
+//  a key might exist, but be ready for expiration.  Then, as the command executes, the key expires
+//  and gets deleted before the write operation.  Consider SET K V.
+//  In the unexpired case, this appears to bgIteration as a single SET command (which replaces the value).
+//  In the expired case, bgIteration will receive a DEL followed by a SET.
+//
+// Another case is a READ command.  A read command won't cause the client to be blocked.  However,
+//  if the key is expired, this will cause a DEL.  For consistent processing, this key might need to
+//  be expedited so that it can be processed before it gets deleted.  In this case, the key is
+//  unlinked from the main Valkey dictionary, but the actual deletion is deferred.
+/////////////////////////////////////////////////////
+#ifdef CODE_NOT_READY_YET
+
+TEST_F(BgIterationTest, expireKeys_NoReplication_NoConsistent) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter",
+            0, NULL, iteratorCleanupFn, PRIVDATA);
+
+    expectReadKey(it, 0);
+    expectReadKey(it, 1);
+
+    // At this point, key 1 is active, key 2 is in queue.
+
+    simulateExpiration(0);        // Past - we no longer care
+    simulateExpirationOfInuse(2); // Current - it's inuse
+    simulateExpiration(5);        // Future - we don't care (non-consistent)
+
+    expectReadKeySequence(it, 2, 4);
+    // key 5 has been deleted
+    expectReadKeySequence(it, 6, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+TEST_F(BgIterationTest, expireKeys_Replication_NoConsistent) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter",
+            BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
+
+    expectReadKey(it, 0);
+    expectReadKey(it, 1);
+
+    // At this point, key 1 is active, key 2 is in queue.
+
+    simulateExpiration(0);        // Past - we expect replication
+    simulateExpirationOfInuse(2); // Current - it's inuse, but we expect replication
+    simulateExpiration(5);        // Future - we don't care (non-consistent)
+
+    expectReadKey(it, 2); // this was already queued
+    expectReadReplicationDel(it, 0); // Past item should replicate
+    expectReadReplicationDel(it, 2); // Current item should replicate
+    // Item 5 is a future item and doesn't need to replicate
+
+    expectReadKeySequence(it, 3, 4);
+    // Item 5 has been deleted
+    expectReadKeySequence(it, 6, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+TEST_F(BgIterationTest, expireKeys_NoReplication_YesConsistent) {
+    bgIterator *it = bgIteratorCreateFullScanIter("iter",
+            BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
+
+    expectReadKey(it, 0);
+    expectReadKey(it, 1);
+
+    // At this point, key 1 is active, key 2 is in queue.
+
+    simulateExpiration(0);             // Past - we no longer care
+    simulateExpirationOfInuse(2);      // Current - we must defer
+    simulateExpirationWithExpedite(5); // Future - will become inuse and expedited for consistency
+
+    expectReadKey(it, 5);  // Expedited to front
+
+    expectReadKeySequence(it, 2, 4);
+    // Item 5 has been deleted
+    expectReadKeySequence(it, 6, LAST_ITEM);
+    expectReadComplete(it);
+}
+
+
+// Special case during a non-consistent iteration with replication and expiration.
+//  1. A future key is created (and processed by its replication) - considered early iterated
+//  2. Later the key is expired and deleted during command processing (causes DEL to be sent) - no longer early iterated
+//  3. The key is recreated as part of the command processing (and this command was replicated) - again early iterated
+//  4. Finally, when we iterate to the key, it shouldn't be sent, because it was replicated in step 3.
+TEST_F(BgIterationTest, expireKeys_Replication_NoConsistent_FutureKeyCreatedThenExipredDuringSet) {
+    simpleDelItem(8);   // Start with a missing future item
+    bgIterator *it = bgIteratorCreateFullScanIter("iter",
+            BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
+
+    expectReadKey(it, 0);  // Get the iterator started
+
+    client *c = getWriteClient(8, "xxx");
+    simulateUnblockedWriteWithModification(c); // Not blocked because this is a future key (but we expect repl)
+
+    // Now do it again, but break out the steps so that we can simulate an expiration
+    bool blocked = bgIteration_blockClientIfRequired(c);
+    EXPECT_FALSE(blocked); // Shouldn't be blocked because this is a future key
+
+    // Now, as the SET command tries to execute, simulate that the key is expired.  Expiration
+    //  processing sends the replication FIRST!
+    robj *argv[2];
+    argv[0] = createStringObjectFromSds(sdsnew("DEL"));
+    argv[1] = c->argv[1];
+    serverCommand *cmd = lookupCommandByCString("DEL");
+    bgIteration_handleCommandReplication(getDbFromItemNum(8), cmd, 2, argv);
+    decrRefCount(argv[0]);
+
+    // Now the call to keyDelete happens (after the replication).
+    bgIteration_keyDelete(getDbFromItemNum(8), static_cast<sds>(objectGetVal(c->argv[1])));
+    simpleDelItem(8);     // Simulate the actual del
+
+    // Now the SET will run, re-creating the item (which is still a future item)
+    // We need to duplicate the value because setKey() can reallocate it.
+    robj *value = dupStringObject(c->argv[2]);
+    setKey(c, c->db, c->argv[1], &(value), SETKEY_ADD_OR_UPDATE);
+
+    // Finally, replication will be sent because this is creating a new key
+    bgIteration_handleCommandReplication(getDbFromItemNum(8), c->cmd, c->argc, c->argv);
+
+    // Test that everything comes as expected
+    expectReadKeySequence(it, 1, 2);    // All one bucket - queued after key 0 read
+
+    expectReadReplication(it, c);       // Repl from the first SET command
+    expectReadReplicationDel(it, 8);    // This is the expected replication of the DEL from expire
+    expectReadReplication(it, c);       // Repl from the second SET command (recreating deleted key)
+
+    expectReadKeySequence(it, 3, 7);    // continue with normal iteration
+    // KEY 8 SHOULD BE OMITTED - This was already replicated
+    expectReadKeySequence(it, 9, LAST_ITEM);
+
+    expectReadComplete(it);
+}
+
+
+/////////////////////////////////////////////////////
+// THE REMAINING TESTS ARE GENERAL / UNCATEGORIZED
+/////////////////////////////////////////////////////
+
+// Iteration can be terminated from the main thread or from the child client.
+//  This tests termination driven from the main thread.
 TEST_F(BgIterationTest, earlyTerminationFromMain) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter", 0, NULL, iteratorCleanupFn, PRIVDATA);
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // At this point, keys 1, 2, 3 are in queue.  A termination should release those keys.
+    // At this point, keys 1 & 2 are in queue.  A termination should release those keys.
     bool blocked1 = true;
     bool blocked2 = true;
-    bool blocked3 = true;
+    // We expect no general unblocks, we account for each specific unblock below.
+    EXPECT_CALL(mock, amzUnblockClientsOnKey(_,_)).Times(0);
+    // We should expect to see unblock called for items 1-4, as they are released from the queue.
     EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(1))))
             .WillOnce(Assign(&blocked1, false));
     EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(2))))
             .WillOnce(Assign(&blocked2, false));
-    EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(3))))
-            .WillOnce(Assign(&blocked3, false));
     bgIteratorTerminate(it);        // queues the items for release
     EXPECT_TRUE(bgIteratorIsTerminating(it));
     bgIteration_feedIterators();    // actually performs the release
     EXPECT_FALSE(blocked1);
     EXPECT_FALSE(blocked2);
-    EXPECT_FALSE(blocked3);
 
+    bool blocked0 = true;
+    EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(0))))
+            .WillOnce(Assign(&blocked0, false));
     bgIteratorItem *item = bgIteratorRead(it);
-    ASSERT_EQ(item->type, BGITERATOR_ITEM_TERMINATED);
+    EXPECT_FALSE(blocked0);
+    EXPECT_EQ(item->type, BGITERATOR_ITEM_TERMINATED);
 
     bgIteratorClose(it);            // background thread completes the termination
 
@@ -2094,455 +2165,226 @@ TEST_F(BgIterationTest, earlyTerminationFromMain) {
 }
 
 
+// Iteration can be terminated from the main thread or from the child client.
+//  This tests termination driven from the child client (the background thread).
 TEST_F(BgIterationTest, earlyTerminationFromChild) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter", 0, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
-    // At this point, keys 1, 2, 3 are in queue.  A termination should release those keys.
+    // At this point, keys 1 & 2 are in queue.  A termination should release those keys.
     bgIteratorClose(it);            // background thread initiates the termination
     EXPECT_TRUE(bgIteratorIsTerminating(it));
 
+    bool blocked0 = true;
     bool blocked1 = true;
     bool blocked2 = true;
-    bool blocked3 = true;
+    // Expecting no extra unblocks
+    EXPECT_CALL(mock, amzUnblockClientsOnKey(_,_)).Times(0);
+    // We expect item 0 (the in progress item) to be released
+    EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(0))))
+            .WillOnce(Assign(&blocked0, false));
+    // We expect items 1-4 (the queued items) to be released
     EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(1))))
             .WillOnce(Assign(&blocked1, false));
     EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(2))))
             .WillOnce(Assign(&blocked2, false));
-    EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(3))))
-            .WillOnce(Assign(&blocked3, false));
-    bgIteration_feedIterators();    // First call handles iterator release
-    bgIteration_feedIterators();    // Second call handles keys released at iterator close
+    bgIteration_feedIterators();
+    EXPECT_FALSE(blocked0);
     EXPECT_FALSE(blocked1);
     EXPECT_FALSE(blocked2);
-    EXPECT_FALSE(blocked3);
     EXPECT_EQ(cleanupCount, 1);
     EXPECT_TRUE(cleanupTerminated);
 }
 
-// Test item expiration
-// A read on the Valkey main thread can trigger an item expiration.  As a READ operation, the client
-//  wouldn't have been blocked.  In this case, we expedite if needed for consistent processing, and
-//  if the item is in use by an iterator, the item is unlinked from the Valkey dictionary, but the
-//  actual deletion is deferred.
 
-TEST_F(BgIterationTest, expireKeys_NoReplication_NoConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-            0, NULL, iteratorCleanupFn, PRIVDATA);
-
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);
-
-    // At this point, key 1 is active, keys 2 & 3 & 4 are in queue.
-
-    simulateExpirationImmediate(0);     // Past - we no longer care
-    simulateExpirationDeferred(2);      // Current - we must defer
-    simulateExpirationImmediate(5);     // Future - we don't care (non-consistent)
-
-    expectReadKeySequence(it, 2, 4);
-    // key 5 has been deleted
-    expectReadKeySequence(it, 6, 9);
-    expectReadComplete(it);
-}
-
-TEST_F(BgIterationTest, expireKeys_Replication_NoConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-            BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
-
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);
-
-    // At this point, key 1 is active, keys 2 & 3 & 4 are in queue.
-
-    simulateExpirationImmediate(0);     // Past - we expect replication
-    simulateExpirationDeferred(2);      // Current - we must defer, but we expect replication
-    simulateExpirationImmediate(5);     // Future - we don't care (non-consistent)
-
-    expectReadKeySequence(it, 2, 4);
-    expectReadReplicationDel(it, 0);    // Past item should replicate
-    expectReadReplicationDel(it, 2);    // Current item should replicate
-    // Item 5 is a future item and doesn't need to replicate
-
-    // key 5 has been deleted
-    expectReadKeySequence(it, 6, 9);
-    expectReadComplete(it);
-}
-
-TEST_F(BgIterationTest, expireKeys_Replication_NoConsistent_FutureKeyCreatedThenExipredDuringSet) {
-    // This tests a condition reported in ELMO-39692.  A future key is expired after having been
-    //  created and marked as early iterated.
-    simpleDelItem(8);   // Start with a missing future item
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-            BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
-
-    expectReadKey(it, 0, nullptr);  // Get the iterator started
-
-    client *c = getWriteClient(8, "xxx");
-    simulateActualWrite(c);         // Not blocked because this is a future key (but we expect repl)
-
-    // Now do it again, but break out the steps so that we can simulate an expiration
-    bool blocked = bgIteration_blockClientIfRequired(c);
-    EXPECT_FALSE(blocked);          // Shouldn't be blocked because this is a future key
-
-    // Now, as the SET command tries to execute, simulate that the key is expired.  Expiration
-    //  processing sends the replication FIRST!
-    robj *argv[2];
-    argv[0] = createObject(OBJ_STRING, sdsnew("DEL"));
-    argv[1] = c->argv[1];
-    serverCommand *cmd = lookupCommandByCString("DEL");
-    int db = 1;
-    bgIteration_handleCommandReplication(db, cmd, 2, argv);
-    decrRefCount(argv[0]);
-
-    // Now the call to keyDelete happens (after the replication).
-    bgIteration_keyDelete(db, static_cast<sds>(objectGetVal(c->argv[1])));
-    simpleDelItem(8);     // Simulate the actual del
-
-    // Now the SET will run, re-creating the item (which is still a future item)
-    // We need to duplicate the value because setKey() can reallocate it.
-    robj *value = dupStringObject(c->argv[2]);
-    setKey(c, c->db, c->argv[1], &(value), SETKEY_ADD_OR_UPDATE);
-
-    // Finally, replication will be sent because this is creating a new key
-    bgIteration_handleCommandReplication(db, c->cmd, c->argc, c->argv);
-
-    // Test that everything comes as expected
-    expectReadKeySequence(it, 1, 4);    // All one bucket - queued after key 0 read
-
-    expectReadReplication(it, c);       // Repl from the first SET command
-    expectReadReplicationDel(it, 8);    // This is the expected replication of the DEL from expire
-    expectReadReplication(it, c);       // Repl from the second SET command (recreating deleted key)
-
-    expectReadKeySequence(it, 5, 7);    // continue with normal iteration
-    // KEY 8 SHOULD BE OMITTED - This was already replicated
-    expectReadKey(it, 9, nullptr);
-
-    expectReadComplete(it);
-}
-
-TEST_F(BgIterationTest, expireKeys_NoReplication_YesConsistent) {
-    bgIterator *it = bgIteratorCreateFullScanIter("iter",
-            BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
-
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);
-
-    // At this point, key 1 is active, keys 2 & 3 & 4 are in queue.
-
-    simulateExpirationImmediate(0);     // Past - we no longer care
-    simulateExpirationDeferred(2);      // Current - we must defer
-    simulateExpirationDeferred(5);      // Future - item must be expedited for consistency
-
-    expectReadKey(it, 5, nullptr);  // Expedited to front
-
-    expectReadKeySequence(it, 2, 4);
-
-    expectReadKeySequence(it, 6, 9);
-    expectReadComplete(it);
-}
-
+// Edge case.  Executing a command (like SUNIONSTORE) which REPLACES the first key and reads the
+//  second key.  In this case, bgIteration will get notified of the key deletion during execution of
+//  SETUNIONSTORE.  Given that both keys are in the future (not iterated yet), we'll allow the
+//  command to execute, unblocked.  We won't replicate as we'll pick up the key when we get to it.
 TEST_F(BgIterationTest, writeWith2Keys_Replication_NoConsistent_keyDeletedDuringSetReplace) {
-    // This tests a condition reported in ELMO-43683. A future key is set with a write command that
-    //  deletes the key in order to replace it. This write command depends on 1 other key that is
-    //  in the future.
-
-    // Expected sequence of event for this test:
-    // ITEM: (0)'C0' : 'C0'
-    // BLCK?: (0)'sunionstore' 'E0' 'D0' 
-    // KEYDEL: (1)E0
-    // REPL?: (1)'sunionstore' 'E0' 'D0' 
-    // ITEM: (0)'A0' : 'A0'
-    // ITEM: (0)'B0' : 'B0'
-    // ITEM: (0)'D0' : 'D0'
-    // ITEM: (0)'E0' : 'new value'
-    // ITEM: (1)'B1' : 'B1'
-    // ITEM: (1)'C1' : 'C1'
-    // ITEM: (1)'D1' : 'D1'
-    // ITEM: (1)'A1' : 'A1'
-    // ITEM: (1)'E1' : 'E1'
-    //  SENDING COMPLETE
-    //  CLEANUP FN (success)
-
+    // Using DB1 so we have lots of buckets
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    // Start with this to load 0 into the queue - but don't read 0 as that would load 1,2,3 into the queue!
-    bgIteration_feedIterators();
+    expectReadKeySequence(it, 0, 8); // 9 is in queue
 
     // Write command that has 2 keys. 1 existing key that we write to and 1 dependant future key.
-    client *c = getWrite2KeysClient(4, 3);
+    client *c = getWrite2KeysClient("sunionstore", 12, 13);
 
     simulateUnblockedWrite(c);
 
-    const int db = 1;
     // Now the call to keyDelete happens
-    bgIteration_keyDelete(db, static_cast<sds>(objectGetVal(c->argv[1])));
-    simpleDelItem(4);     // So simulate the actual del
+    bgIteration_keyDelete(getDbFromItemNum(12), keyStr(12));
+    simpleDelItem(12);     // So simulate the actual del
 
     // Now the write will run, re-creating the item (which is still a future item)
     const char * const newValueStr = "new value";
-    robj *newValueRobj = createObject(OBJ_STRING, sdsnew(newValueStr));
+    robj *newValueRobj = createStringObjectFromSds(sdsnew(newValueStr));
     setKey(c, c->db, c->argv[1], &newValueRobj, SETKEY_ADD_OR_UPDATE);
 
     // Finally, we are letting bgIteration know that the write command was executed
-    bgIteration_handleCommandReplication(db, c->cmd, c->argc, c->argv);
+    bgIteration_handleCommandReplication(getDbFromItemNum(12), c->cmd, c->argc, c->argv);
 
     // Since the write command was not replicated, we expect all the keys to be read in the normal
     //  order from the dictionary.
-    expectReadKeySequence(it, 0, 3);
-    expectReadKey(it, 4, newValueStr);
-    expectReadKeySequence(it, 5, 9);
+    expectReadKeySequence(it, 9, 11);
+    expectReadKey(it, 12, newValueStr);
+    expectReadKeySequence(it, 13, LAST_ITEM);
 
     expectReadComplete(it);
     freeTestClient(c);
 }
 
 
+// Edge case.  When we have a new key which is created by a command, AND replication is enabled, we
+//  expect that we will replicate the command rather than serializing the key/value later.  As an
+//  example, consider SUNIONSTORE A B.  We want to create A by replicating the command.  We don't
+//  want to have to process A as a key later on.  But in this case, we can't run the command until
+//  B has been sent.  We expect the command to be blocked while we send B.
 TEST_F(BgIterationTest, writeWith2Keys_Replication_NoConsistent_setNewKey_DependantFuture) {
-    // This tests the replication of a write command that creates a new key and depends on one other
-    //  key that is in the future.
-
-    // Expected sequence of event for this test:
-    //  ITEM: (0)'D0' : 'D0'
-    //  BLCK?: (0)'sunionstore' 'C0' 'A0'
-    //  EARLY: (0)'A0' : 'A0'
-    //   (blocked)
-    //  ITEM: (0)'E0' : 'E0'
-    //  ITEM: (0)'B0' : 'B0'
-    //  BLCK?: (0)'sunionstore' 'C0' 'A0'
-    //  REPL?: 'sunionstore' 'C0' 'A0'
-    //   (queued)
-    //  ITEM: (1)'E1' : 'E1'
-    //  ITEM: (1)'C1' : 'C1'
-    //  ITEM: (1)'B1' : 'B1'
-    //  ITEM: (1)'A1' : 'A1'
-    //  ITEM: (1)'D1' : 'D1'
-    //  SENDING COMPLETE
-    //  CLEANUP FN (success)
-
-    simpleDelItem(4);   // Deleting key 4 to then create it with a write command
+    // Using DB1 so we have lots of buckets
+    simpleDelItem(12);   // Deleting key 12 to then create it with a write command
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    // Start with this to load 0 into the queue - but don't read 0 as that would load 1,2,3 into the queue!
-    bgIteration_feedIterators();
+    expectReadKeySequence(it, 0, 8); // 9 is in queue
 
     // Write command that has 2 keys. 1 new key and 1 dependant future key.
-    client *c = getWrite2KeysClient(4, 3);
+    client *c = getWrite2KeysClient("sunionstore", 12, 13);
 
     // We are simulating a new key in the dict. This command should block on the dependant key.
-    // This adds key 3 in the queue since the command depends on it.
+    // This adds key 13 in the queue since the command depends on it.
     simulateBlockedWrite(c);
 
-    // Key 0 was already in the queue
-    expectReadKey(it, 0, nullptr);
+    // Key 9 was already in the queue
+    expectReadKey(it, 9);
 
-    // Key 3 is processed out of order since the write depends on it
-    expectReadKey(it, 3, nullptr);
+    // Key 13 is processed out of order since the write depends on it
+    expectReadKey(it, 13);
 
-    // Keys 1,2 are next in the dict (they are all in the same bucket).
-    // Only reading key 1 for now to release key 3 from the iterator.
-    expectReadKey(it, 1, nullptr);
+    // Reading key 10 will unblock key 13, allowing us to write.
+    expectReadKey(it, 10);
 
-    // Now that key 3 was processed and released by the iterator, the write command can be executed.
-    simulateActualWrite(c);
+    // Now that key 13 was processed and released by the iterator, the write command can be executed.
+    simulateUnblockedWriteWithModification(c);
 
-    // Key 2 was enqueued at the same time as key 1 since they are in the same bucket
-    expectReadKey(it, 2, nullptr);
+    // Key 11 was queued when we read key 10
+    expectReadKey(it, 11);
 
-    // The replication of the write command was enqueued after keys 1,2.
+    // The replication of the write command was enqueued after key 11
     expectReadReplication(it, c);
 
+    // We shouldn't see key 12 - as that was processed via replication.
+    // We shouldn't see key 13 - as that was expedited earlier
+
     // Now resuming processing of dict entries
-    expectReadKeySequence(it, 5, 9);
+    expectReadKeySequence(it, 14, LAST_ITEM);
 
     expectReadComplete(it);
     freeTestClient(c);
 }
 
 
+// A new key is being created, but is dependent on another key which has already been processed.
+//  In this case, the command shouldn't be blocked.
 TEST_F(BgIterationTest, writeWith2Keys_Replication_NoConsistent_setNewKey_DependantPast) {
-    // This tests the replication of a write command that creates a new key and depends on one other
-    //  key that is in the past.
-
-    // Expected sequence of event for this test:
-    // ITEM: (0)'C0' : 'C0'
-    // ITEM: (0)'A0' : 'A0'
-    // ITEM: (0)'B0' : 'B0'
-    // ITEM: (0)'D0' : 'D0'
-    // ITEM: (1)'B1' : 'B1'
-    // ITEM: (1)'C1' : 'C1'
-    // ITEM: (1)'D1' : 'D1'
-    // BLCK?: (0)'sunionstore' 'E0' 'C0' 
-    // REPL?: (0)'sunionstore' 'E0' 'C0' 
-    //  (queued)
-    // ITEM: (1)'A1' : 'A1'
-    // ITEM: (1)'E1' : 'E1'
-    //  SENDING COMPLETE
-    //  CLEANUP FN (success)
-
-    simpleDelItem(4);   // Deleting key 4 to then create it with a write command
+    // Using DB1 so we have lots of buckets
+    simpleDelItem(12);   // Deleting key 12 to then create it with a write command
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKeySequence(it, 0, 3);    // Get the iterator started
+    expectReadKeySequence(it, 0, 9); // 10 is in queue, done with 8
 
     // Write command that has 2 keys. 1 new key and 1 dependant past key.
-    client *c = getWrite2KeysClient(4, 0);
+    client *c = getWrite2KeysClient("sunionstore", 12, 8);
 
     // We are simulating a new key in the dict.
     // This command should not block since the dependant key has already been processed.
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
-    // Key 5, 6, 7 was put in the queue before the write
-    expectReadKeySequence(it, 5, 7);
+    // Key 10 was put in the queue before the write
+    expectReadKey(it, 10);
 
     expectReadReplication(it, c);
 
-    // Now resuming processing of dict entries.
-    expectReadKeySequence(it, 8, 9);
+    expectReadKey(it, 11);
 
+    // Key 12 should be missing - it was processed by replication
+
+    expectReadKeySequence(it, 13, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
 
+// A new key is being created, and has dependencies on 2 other keys - one already processed, one not.
+//  In this case, the command should be blocked so that the future key can be sent first.
 TEST_F(BgIterationTest, writeWith3Keys_Replication_NoConsistent_setNewKey_1DependantPast1DependantFuture) {
-    // This tests the replication of a write command that creates a new key and depends on 2 other
-    //  keys, one of which is in the past, and one is in the future.
-
-    // Expected sequence of event for this test:
-    //  ITEM: (0)'D0' : 'D0'
-    //  BLCK?: (0)'sunionstore' 'E0' 'D0' 'C0'
-    //  EARLY: (0)'C0' : 'C0'
-    //   (blocked)
-    //  ITEM: (0)'B0' : 'B0'
-    //  ITEM: (0)'A0' : 'A0'
-    //  BLCK?: (0)'sunionstore' 'E0' 'D0' 'C0'
-    //  REPL?: 'sunionstore' 'E0' 'D0' 'C0'
-    //   (queued)
-    //  ITEM: (1)'E1' : 'E1'
-    //  ITEM: (1)'C1' : 'C1'
-    //  ITEM: (1)'B1' : 'B1'
-    //  ITEM: (1)'A1' : 'A1'
-    //  ITEM: (1)'D1' : 'D1'
-    //  SENDING COMPLETE
-    //  CLEANUP FN (success)
-
-    simpleDelItem(1);   // Deleting key 1 to then create it with a write command
+    // Using DB1 so we have lots of buckets
+    simpleDelItem(12);   // Deleting key 12 to then create it with a write command
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    // Start with this to load 0 into the queue - but don't read 0 as that would load 1,2,3 into the queue!
-    bgIteration_feedIterators();
+    expectReadKeySequence(it, 0, 9); // 8 has been returned, 9 is active, 10 is in queue
 
-    // Write command that has 3 keys. 1 new key and 2 dependant keys, one of which is in the past
-    //  and the other is in the future.
-    client *c = getWrite3KeysClient(1, 0, 4);
+    // Write command that has 1 new key and 2 dependencies (past/future)
+    client *c = getWrite3KeysClient("sunionstore", 12, 8, 13);
 
-    // We are simulating a new key in the dict.
-    // This command should block on 2 keys (0 and 4), since:
-    //  - key 0 is in use by the iterator (still in the queue since it has not been processed by the consumer yet)
-    //  - key 4 is in the future
-    // This adds key 4 in the queue since the command depends on it and it hasn't been processed yet.
-    simulateBlockedWrite(c, 2);
+    // The write should be blocked, so that item 13 can be processed.
+    simulateBlockedWrite(c);
 
-    // Key 0 was already enqueued.
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 10); // 10 was already in queue
+    expectReadKey(it, 13); // 13 was expedited since the write depends on it
+    EXPECT_CALL(mock, amzUnblockClientsOnKey(_,robjEqualsStr(keyStr(13)))).Times(1);
+    expectReadKey(it, 11); // Releases 13 so the command can execute
 
-    // Key 4 is processed out of order since the write depends on it
-    expectReadKey(it, 4, nullptr);
+    simulateUnblockedWriteWithModification(c);
 
-    // Keys 2,3 are next in the queue (they are all in the same bucket).
-    // Only reading key 2 for now to release key 4 from the iterator.
-    expectReadKey(it, 2, nullptr);
+    expectReadKey(it, 14); // was queued when reading 11 (12 is missing, 13 was expedited)
 
-    // Now that key 4 was processed and released by the iterator, the write command can be executed.
-    simulateActualWrite(c);
-
-    // Key 3 is next in the queue (it was put in the queue at the same time as key 2).
-    expectReadKey(it, 3, nullptr);
-
-    // The replication of the write command was enqueued after keys 2,3.
     expectReadReplication(it, c);
 
-    // Now resuming processing of dict entries.
-    expectReadKeySequence(it, 5, 9);
-
+    expectReadKey(it, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
 
-
+// Test an edge case with the same (future) key being repeated in the command, like:
+//  SUNIONSTORE A B B
+// In this test, A is a previously handled key, and B is a future key.  We expect the future key B to
+//  be expedited (once).
 TEST_F(BgIterationTest, writeWith3Keys_Replication_NoConsistent_repeatedKey_1DependantPast1RepeatedFuture) {
-    // This tests the replication of a write command that updates a key and depends on 1 other key
-    //  which is repeated in the command. The repeated key is in the future and the other key is
-    //  in the past.
-    // This test is meant to replicate this bug: https://issues.amazon.com/ELMO-46572
-
-    // Expected sequence of event for this test:
-    //  ITEM: (0)'D0' : 'D0'
-    //  BLCK?: (0)'sunionstore' 'D0' 'C0' 'C0'
-    //  EARLY: (0)'C0' : 'C0'
-    //   (blocked)
-    //  ITEM: (0)'E0' : 'E0'
-    //  ITEM: (0)'B0' : 'B0'
-    //  ITEM: (0)'A0' : 'A0'
-    //  BLCK?: (0)'sunionstore' 'D0' 'C0' 'C0'
-    //  REPL?: (0)'sunionstore' 'D0' 'C0' 'C0'
-    //   (queued)
-    //  SKIPPING ITEM(early iterate): (0)'C0' : 'C0'
-    //  ITEM: (1)'E1' : 'E1'
-    //  ITEM: (1)'C1' : 'C1'
-    //  ITEM: (1)'B1' : 'B1'
-    //  ITEM: (1)'A1' : 'A1'
-    //  ITEM: (1)'D1' : 'D1'
-    //  SENDING COMPLETE
-    //  CLEANUP FN (success)
-
+    // Using DB1 so we have lots of buckets
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    // Start with this to load 0 into the queue - but don't read 0 as that would load 1,2,3 into the queue!
-    bgIteration_feedIterators();
+    expectReadKeySequence(it, 0, 9); // We're done with 8, and 10 is in queue
 
     // Write command that has 3 keys. 1 past key and 1 repeated key in the future.
-    client *c = getWrite3KeysClient(0, 4, 4);
+    client *c = getWrite3KeysClient("sunionstore", 8, 12, 12);
 
-    // This command should block on 2 keys (0 and 4), since:
-    // - key 0 is in use by the iterator (still in the queue since it has not been processed by the consumer yet)
-    // - key 4 is in the future
-    // This adds key 4 in the queue because:
-    // - the command depends on key 4 which hasn't been processed yet
-    // - the command depends on key 0 which is in the past
-    simulateBlockedWrite(c, 2);
+    // This command should block because 12 needs to be expedited.
+    simulateBlockedWrite(c);
 
-    // Key 0 was already enqueued.
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 10); // was already in queue
+    expectReadKey(it, 12); // expedited
+    expectReadKey(it, 11); // releases 12 (unblocking the command)
 
-    // Key 4 is processed out of order since the write depends on it
-    expectReadKey(it, 4, nullptr);
+    // Now that key 12 was processed and released by the iterator, the write command can be executed.
+    simulateUnblockedWriteWithModification(c);
 
-    // Keys 1,2,3 are next in the queue (they are all in the same bucket).
-    // Only reading key 1 for now to release key 4 from the iterator.
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 13); // queued when we read 11
 
-    // Now that key 4 was processed and released by the iterator, the write command can be executed.
-    simulateActualWrite(c);
-
-    // Keys 2, 3 are next in the queue (it was put in the queue at the same time as key 1).
-    expectReadKeySequence(it, 2, 3);
-
-    // The replication of the write command was enqueued after keys 1,2,3.
     expectReadReplication(it, c);
 
     // Now resuming processing of dict entries.
-    expectReadKeySequence(it, 5, 9);
-
+    expectReadKeySequence(it, 14, LAST_ITEM);
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
+#ifdef CODE_NOT_READY_YET
 
 
 TEST_F(BgIterationTest, writeWith3Keys_Replication_NoConsistent_repeatedKey_1newKey1RepeatedFuture) {
@@ -2586,20 +2428,20 @@ TEST_F(BgIterationTest, writeWith3Keys_Replication_NoConsistent_repeatedKey_1new
     simulateBlockedWrite(c);
 
     // Key 0 was already enqueued.
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Key 4 is processed out of order since the write depends on it
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 4);
 
     // Keys 2,3 are next in the queue (they are all in the same bucket).
     // Only reading key 2 for now to release key 4 from the iterator.
-    expectReadKey(it, 2, nullptr);
+    expectReadKey(it, 2);
 
     // Now that key 4 was processed and released by the iterator, the write command can be executed.
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // Key 3 is next in the queue (it was put in the queue at the same time as key 2).
-    expectReadKey(it, 3, nullptr);
+    expectReadKey(it, 3);
 
     // The replication of the write command was enqueued after keys 1,2,3.
     expectReadReplication(it, c);
@@ -2656,18 +2498,18 @@ TEST_F(BgIterationTest, writeWith3Keys_NoReplication_Consistent_repeatedKey_1Dep
     // Key 4 is processed out of order since the write depends on it.
     // Key 4 is processed before key 0 even though key 0 was already in the queue
     //  because key 4 was enqueued as a priority item.
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 4);
 
     // Key 0 was already enqueued.
     // Reading key 0 releases key 4 from the iterator.
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Keys 1,2,3 are next in the queue (they are all in the same bucket).
     // Only reading key 1 for now to release key 0 from the iterator.
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // Now that keys 4 and 0 were processed and released by the iterator, the write command can be executed.
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // Keys 2, 3 are next in the queue (it was put in the queue at the same time as key 1).
     expectReadKeySequence(it, 2, 3);
@@ -2781,11 +2623,11 @@ TEST_F(BgIterationTest, writeWith3Keys_NoReplication_NoConsistent_repeatedKey_1r
     // Getting started
     // The first bucket is empty
     bgIteration_feedIterators();
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Key 1 is the next in the queue.
     // Reading key 1 to release key 0 from the iterator.
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // Write command that has 3 keys. 1 new repeated key and 1 key in the past.
     // How BLPOP works exactly is not relevant to bgIterator, we just chose BLPOP because it's a
@@ -2793,7 +2635,7 @@ TEST_F(BgIterationTest, writeWith3Keys_NoReplication_NoConsistent_repeatedKey_1r
     client *c = getWriteMultiKeysClient(4, {0, 4, 0}, "blpop");
 
     // The write command is not blocked since key 0 is not in use by the iterator
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // Keys 2, 3 are next in the queue (it was put in the queue at the same time as key 1).
     expectReadKeySequence(it, 2, 3);
@@ -2835,18 +2677,18 @@ TEST_F(BgIterationTest, copyHandlesProperDb_Replication_NoConsistent) {
     c->db = server.db[0];
     c->argc = 6;
     c->argv = static_cast<robj**>(zcalloc(sizeof(robj*) * c->argc));
-    c->argv[0] = createObject(OBJ_STRING, sdsnew(c->cmd->fullname));
-    c->argv[1] = createObject(OBJ_STRING, sdsnew("C0"));
-    c->argv[2] = createObject(OBJ_STRING, sdsnew("E0"));
-    c->argv[3] = createObject(OBJ_STRING, sdsnew("DB"));
-    c->argv[4] = createObject(OBJ_STRING, sdsnew("1"));
-    c->argv[5] = createObject(OBJ_STRING, sdsnew("REPLACE"));
+    c->argv[0] = createStringObjectFromSds(sdsnew(c->cmd->fullname));
+    c->argv[1] = createStringObjectFromSds(sdsnew("C0"));
+    c->argv[2] = createStringObjectFromSds(sdsnew("E0"));
+    c->argv[3] = createStringObjectFromSds(sdsnew("DB"));
+    c->argv[4] = createStringObjectFromSds(sdsnew("1"));
+    c->argv[5] = createStringObjectFromSds(sdsnew("REPLACE"));
 
     // This should block on 2 keys.  DB0:C0 is in queue.  DB1:E0 needs to be expedited.
     simulateBlockedWrite(c, 2);
-    expectReadKey(it, 0, nullptr);              // DB0:C0
+    expectReadKey(it, 0);              // DB0:C0
     expectReadDbKeyValue(it, 1, "E0", "E0");    // DB1:E0 is expedited
-    expectReadKey(it, 1, nullptr);              // (to release DB1:E0)
+    expectReadKey(it, 1);              // (to release DB1:E0)
     // Now keys 2 & 3 & 4 are in the queue
 
     simulateUnblockedWrite(c);  // We shouldn't be blocked this time
@@ -2875,11 +2717,11 @@ TEST_F(BgIterationTest, terminateWithReplication) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);  // makes sure we are done with key 0 (don't want to block)
+    expectReadKey(it, 0);
+    expectReadKey(it, 1);  // makes sure we are done with key 0 (don't want to block)
 
     client *c = getWriteClient(0, "xxx");
-    simulateActualWrite(c);     // Should replicate
+    simulateUnblockedWriteWithModification(c);     // Should replicate
     freeTestClient(c);
 
     bgIteratorTerminate(it);
@@ -2906,7 +2748,7 @@ TEST_F(BgIterationTest, swapDB_NoReplication_NoConsistent) {
     //  the time they are placed into the queue.  The SWAPDB event signals the change to the
     //  iterating process - and this is properly sequenced with the DB info for each item.
 
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Keys 1,2,3, and 4 are in queue
     simulateSwapDB(0, 1);       // The swap event will be queued after item 3
@@ -2914,10 +2756,10 @@ TEST_F(BgIterationTest, swapDB_NoReplication_NoConsistent) {
     EXPECT_EQ(status.swapdb_queued, 1u);
     EXPECT_EQ(status.swapdb_processed, 0u);
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
+    expectReadKey(it, 3);
+    expectReadKey(it, 4);
 
     expectReadSwapDB(it, 0, 1);
     bgIteratorGetStatus(it, &status);
@@ -2944,12 +2786,12 @@ TEST_F(BgIterationTest, swapDB_NoReplication_NoConsistent) {
     EXPECT_EQ(status.swapdb_queued, 2u);
     EXPECT_EQ(status.swapdb_processed, 1u);     // still processing it...
 
-    expectReadKey(it, 8, nullptr);
+    expectReadKey(it, 8);
     bgIteratorGetStatus(it, &status);
     EXPECT_EQ(status.swapdb_queued, 2u);
     EXPECT_EQ(status.swapdb_processed, 2u);     // done processing all swaps
 
-    expectReadKey(it, 9, nullptr);
+    expectReadKey(it, 9);
     expectReadComplete(it);
 }
 
@@ -2960,20 +2802,20 @@ TEST_F(BgIterationTest, swapDB_NoReplication_YesConsistent) {
     // In the consistent iterator (without replication) all items are presented to the iterating
     //  process using the DBID at the time of the iterator creation.  No changes are evident.
 
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Keys 1,2,3,4 are in queue
     simulateSwapDB(0, 1);       // The swap occurs, but the iterator sees no change
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
+    expectReadKey(it, 3);
+    expectReadKey(it, 4);
 
     // Heck, let's go crazy with those swaps...
     for (int itemNum = 5;  itemNum <= 9;  itemNum++) {
         simulateSwapDB(0, 1);
-        expectReadKey(it, itemNum, nullptr);
+        expectReadKey(it, itemNum);
     }
 
     expectReadComplete(it);
@@ -2987,15 +2829,15 @@ TEST_F(BgIterationTest, swapDB_YesReplication_NoConsistent) {
     //  time they are placed into the queue.  The SWAPDB event signals the change to the iterating
     //  process - and this is properly sequenced with the DB info for each item.
 
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Keys 1,2,3,4 are in queue
     simulateSwapDB(0, 1);       // The swap event will be queued after item 3
 
-    expectReadKey(it, 1, nullptr);
-    expectReadKey(it, 2, nullptr);
-    expectReadKey(it, 3, nullptr);
-    expectReadKey(it, 4, nullptr);
+    expectReadKey(it, 1);
+    expectReadKey(it, 2);
+    expectReadKey(it, 3);
+    expectReadKey(it, 4);
 
     expectReadSwapDB(it, 0, 1);                         // We should see a SWAPDB event
     bgIteratorItem *item = bgIteratorRead(it);          // followed by the associated replication
@@ -3016,8 +2858,8 @@ TEST_F(BgIterationTest, swapDB_YesReplication_NoConsistent) {
     ASSERT_EQ(item->type, BGITERATOR_ITEM_REPLICATION);
     bgIteration_feedIterators();
 
-    expectReadKey(it, 8, nullptr);
-    expectReadKey(it, 9, nullptr);
+    expectReadKey(it, 8);
+    expectReadKey(it, 9);
     expectReadComplete(it);
 }
 
@@ -3029,8 +2871,8 @@ TEST_F(BgIterationTest, swapDB_YesReplication_NoConsistent) {
 TEST_F(BgIterationTest, flushDB_flushAll) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter", 0, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 0);
+    expectReadKey(it, 1);
 
     // key 1 is active in the iterator - this key will be removed from the DB before flush.
     // keys 2 & 3 & 4 are in queue - but will be returned to Valkey before the flush.  These are yanked
@@ -3057,10 +2899,10 @@ TEST_F(BgIterationTest, flushDB_flushOne) {
     // The test flushes DB0.  This is half the data.  Since <= half, a non-consistent iterator is
     //  allowed to proceed.  But the consistent iterator will be terminated.
 
-    expectReadKey(it1, 0, nullptr);
-    expectReadKey(it2, 0, nullptr);
-    expectReadKey(it1, 1, nullptr);
-    expectReadKey(it2, 1, nullptr);
+    expectReadKey(it1, 0);
+    expectReadKey(it2, 0);
+    expectReadKey(it1, 1);
+    expectReadKey(it2, 1);
 
     // key 1 is active in the iterator - this key will be removed from the DB before flush.
     // keys 2 & 3 & 4 are in queue - but will be returned to Valkey before the flush.  These are yanked
@@ -3073,9 +2915,9 @@ TEST_F(BgIterationTest, flushDB_flushOne) {
     // Testing the non-consistent one continues...
     // Everything already on the iterator queue should be preserved (deleted from the DB).
     //  Keys 2 & 3 & 4 are already queued (and preserved).
-    expectReadKey(it1, 2, nullptr);
-    expectReadKey(it1, 3, nullptr);
-    expectReadKey(it1, 4, nullptr);
+    expectReadKey(it1, 2);
+    expectReadKey(it1, 3);
+    expectReadKey(it1, 4);
 
     bgIteratorItem *item = bgIteratorRead(it1);
     ASSERT_EQ(item->type, BGITERATOR_ITEM_FLUSHDB);
@@ -3084,14 +2926,14 @@ TEST_F(BgIterationTest, flushDB_flushOne) {
     EXPECT_EQ(status.flushdb_queued, 1u);
     EXPECT_EQ(status.flushdb_processed, 0u);    // still processing it
 
-    expectReadKey(it1, 5, nullptr);
+    expectReadKey(it1, 5);
     bgIteratorGetStatus(it1, &status);
     EXPECT_EQ(status.flushdb_queued, 1u);
     EXPECT_EQ(status.flushdb_processed, 1u);    // done with all flushdb's
-    expectReadKey(it1, 6, nullptr);
-    expectReadKey(it1, 7, nullptr);
-    expectReadKey(it1, 8, nullptr);
-    expectReadKey(it1, 9, nullptr);
+    expectReadKey(it1, 6);
+    expectReadKey(it1, 7);
+    expectReadKey(it1, 8);
+    expectReadKey(it1, 9);
     expectReadComplete(it1);
     EXPECT_EQ(cleanupCount, 1);
     EXPECT_FALSE(cleanupTerminated);
@@ -3120,7 +2962,7 @@ TEST_F(BgIterationTestCluster, modMissingKey_2iter_cluster) {
             NULL, iteratorCleanupFn, PRIVDATA);
 
     client *c = getWriteClient(4, "xxx");
-    simulateActualWrite(c);     // Wouldn't be blocked since key doesn't exist
+    simulateUnblockedWriteWithModification(c);     // Wouldn't be blocked since key doesn't exist
 
     bgIteration_feedIterators();    // Prime the feed - key 0 and 1 are now enqueued
 
@@ -3143,8 +2985,8 @@ TEST_F(BgIterationTest, twoKeys_firstFuture) {
             NULL, iteratorCleanupFn, PRIVDATA);
 
     bgIteration_feedIterators();    // Prime the feed - key 0
-    expectReadKey(it, 0, nullptr);  // Causes keys 1, 2, 3, 4 to be queued (same bucket)
-    expectReadKey(it, 1, nullptr);  // Causes key 0 to be released
+    expectReadKey(it, 0);  // Causes keys 1, 2, 3, 4 to be queued (same bucket)
+    expectReadKey(it, 1);  // Causes key 0 to be released
 
     // This must replicate, because A0 is in the past.  B1 (future) wouldn't need replication except
     //  for the modification to B1.  We try to trip up bgIterator by giving a key that doesn't need
@@ -3158,13 +3000,13 @@ TEST_F(BgIterationTest, twoKeys_firstFuture) {
     expectReadKeySequence(it, 2, 4);    // These were already in queue
 
     // Note - it would be OK if these 2 were reversed, but this is how the current algorithm works.
-    expectReadKey(it, 8, nullptr);  // Key 8 (A1) was expedited
-    expectReadKey(it, 5, nullptr);  // Key 5 (B1) was expedited
+    expectReadKey(it, 8);  // Key 8 (A1) was expedited
+    expectReadKey(it, 5);  // Key 5 (B1) was expedited
 
     // and clean up the rest...
     expectReadKeySequence(it, 6, 7);
     // Key 8 was already read above (expedited)
-    expectReadKey(it, 9, nullptr);
+    expectReadKey(it, 9);
     expectReadComplete(it);
 }
 
@@ -3173,7 +3015,7 @@ TEST_F(BgIterationTest, multiBlocksOnFutureKey) {
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // At this point, key 0 is read.  Keys 1,2,3,4 are queued (they are all in the same bucket).
     // If we fake a modification to key 5, we won't know if it's handled out of order.
@@ -3186,7 +3028,7 @@ TEST_F(BgIterationTest, multiBlocksOnFutureKey) {
     freeTestClient(c);
 
     // C1 (key 6) will be expedited to the front of the list
-    expectReadKey(it, 6, nullptr);
+    expectReadKey(it, 6);
 
     // Now that we've read key 5, key 0 (C0) is passed and should not block
     client *c2 = getMultiClient("SET C0 xxx");
@@ -3254,11 +3096,11 @@ TEST_F(BgIterationTest, multiNotReplicatedButDelRecreateAccess) {
     // Simulate SET A1 - the key doesn't exist, and would normally replicate and mark early iterate,
     //  but this is in a transaction, and we are not replicating this transaction.
     advanceMultiClientToCommand(c, 1);  // SET A1 xxx
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
 
     // Now write to another existing future key - this should work if we weren't confused by the DEL
     advanceMultiClientToCommand(c, 2);  // SET E1 yyy
-    simulateActualWrite(c);
+    simulateUnblockedWriteWithModification(c);
     server.in_exec = 0;
 
     // Now we can continue iterating, and we should pick up keys 6-9.  (and no replication!)
@@ -3277,10 +3119,10 @@ TEST_F(BgIterationTest, multiHandlesSelectProperly) {
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - C0 in DB 0.
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Now, we are done with C0 in DB0, but not in DB1
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // These cases should NOT block...  (they access C0 in DB0)
     client *c;
@@ -3325,10 +3167,10 @@ TEST_F(BgIterationTest, multiHandlesSelectNoPermissionProperly) {
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - C0 in DB 0.
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Now, we are done with DC00 in DB0, but not in DB1
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // No permission for any commands (specifically select/swapdb)
     EXPECT_CALL(mock, amzCanClientExecuteCommand(_,_,_,_))
@@ -3378,10 +3220,10 @@ TEST_F(BgIterationTest, multiHandlesSwapdbProperly) {
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - C0 in DB 0.
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Now, we are done with C0 in DB0, but not in DB1
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // These cases should NOT block...  (they access C0 in DB0)
     client *c;
@@ -3426,10 +3268,10 @@ TEST_F(BgIterationTest, multiHandlesSwapdbNoPermissionProperly) {
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - C0 in DB 0.
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // Now, we are done with C0 in DB0, but not in DB1
-    expectReadKey(it, 1, nullptr);
+    expectReadKey(it, 1);
 
     // No permission for any commands (specifically select/swapdb)
     EXPECT_CALL(mock, amzCanClientExecuteCommand(_,_,_,_))
@@ -3501,7 +3343,7 @@ TEST_F(BgIterationTest, testLuaWithUndeclaredKey) {
             BGITERATOR_FLAG_CONSISTENT, NULL, iteratorCleanupFn, PRIVDATA);
 
     // Read the 1st key - let's get the party started
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     // At this point, key 0 is read.  Keys 1,2,3 are queued (they are all in the same bucket).
     // If we fake a modification to key 4, we won't know if it's handled out of order.
@@ -3539,10 +3381,10 @@ TEST_F(BgIterationTest, replicationReceivedWhileProcessingLastKey) {
     client *c = getWriteClient(0, "xxx");
 
     expectReadKeySequence(it, 0, 9);
-    simulateActualWrite(c);         // Wouldn't be blocked because done with key 0
+    simulateUnblockedWriteWithModification(c);         // Wouldn't be blocked because done with key 0
     expectReadReplication(it, c);   // Replication happened while processing key 9, should be here.
 
-    simulateActualWrite(c);         // This won't replicate because we are done processing key 9
+    simulateUnblockedWriteWithModification(c);         // This won't replicate because we are done processing key 9
     expectReadComplete(it);         // We expect to see the completion instead
 
     freeTestClient(c);
@@ -3556,11 +3398,11 @@ TEST_F(BgIterationTest, repldoneFunctionCalled) {
     client *c = getWriteClient(0, "xxx");
 
     expectReadKeySequence(it, 0, 9);
-    simulateActualWrite(c);         // Wouldn't be blocked because done with key 0
+    simulateUnblockedWriteWithModification(c);         // Wouldn't be blocked because done with key 0
     expectReadReplication(it, c);   // Replication happened while processing key 9, should be here.
     EXPECT_EQ(repldoneCount, 1);    // Last key released, now done feeding replication
 
-    simulateActualWrite(c);         // This won't replicate because we are done processing key 9
+    simulateUnblockedWriteWithModification(c);         // This won't replicate because we are done processing key 9
     expectReadComplete(it);         // We expect to see the completion instead
 
     freeTestClient(c);
@@ -3574,14 +3416,14 @@ TEST_F(BgIterationTest, repldoneFunctionCalledTwice) {
     client *c = getWriteClient(0, "xxx");
 
     expectReadKeySequence(it, 0, 9);
-    simulateActualWrite(c);         // Wouldn't be blocked because done with key 0
+    simulateUnblockedWriteWithModification(c);         // Wouldn't be blocked because done with key 0
     expectReadReplication(it, c);   // Replication happened while processing key 9, should be here.
     EXPECT_EQ(repldoneCount, 0);    // Last key released, now done feeding replication
     EXPECT_EQ(isReplDoneReady, 1);
     bgIteration_feedIterators();    // Need to call it as RepldoneFnNotBeingReadyInitially returns false in first call
     EXPECT_EQ(repldoneCount, 1);
 
-    simulateActualWrite(c);         // This won't replicate because we are done processing key 9
+    simulateUnblockedWriteWithModification(c);         // This won't replicate because we are done processing key 9
     expectReadComplete(it);         // We expect to see the completion instead
 
     freeTestClient(c);
@@ -3610,13 +3452,13 @@ TEST_F(BgIterationTest, checkReplicationByteCount) {
         expectedReplicationSize += objectComputeSize(NULL, c->argv[i], 0, 0);
     }
 
-    expectReadKey(it, 0, nullptr);
-    expectReadKey(it, 1, nullptr);  // Releases and unblocks 0
+    expectReadKey(it, 0);
+    expectReadKey(it, 1);  // Releases and unblocks 0
     EXPECT_EQ(bgIteration_memoryInuseForReplication(), 0u);
 
-    simulateActualWrite(c);         // Wouldn't be blocked because done with key 0
+    simulateUnblockedWriteWithModification(c);         // Wouldn't be blocked because done with key 0
     EXPECT_EQ(bgIteration_memoryInuseForReplication(), expectedReplicationSize);
-    simulateActualWrite(c);         // and write again (2nd replication)
+    simulateUnblockedWriteWithModification(c);         // and write again (2nd replication)
     EXPECT_EQ(bgIteration_memoryInuseForReplication(), 2 * expectedReplicationSize);
 
     expectReadKeySequence(it, 2, 4);    // Keys 1..4 all in same bucket
@@ -3628,7 +3470,7 @@ TEST_F(BgIterationTest, checkReplicationByteCount) {
     // After reading the 2nd replication, the 1st has been returned
     EXPECT_EQ(bgIteration_memoryInuseForReplication(), expectedReplicationSize);
 
-    expectReadKey(it, 5, nullptr);
+    expectReadKey(it, 5);
     // Now all replication has been returned/freed
     EXPECT_EQ(bgIteration_memoryInuseForReplication(), 0u);
 
@@ -3643,7 +3485,7 @@ TEST_F(BgIterationTest, checkNoKeysWriteIsReplicated) {
     bgIterator *it = bgIteratorCreateFullScanIter("iter",
             BGITERATOR_FLAG_REPLICATION, NULL, iteratorCleanupFn, PRIVDATA);
 
-    expectReadKey(it, 0, nullptr);
+    expectReadKey(it, 0);
 
     client *c = getNoKeysWriteClient();
     EXPECT_CALL(mock, amzBlockClientOnKeys(_,c,_,_)).Times(0);
@@ -3777,5 +3619,69 @@ class BgIterationTestCluster : public BgIterationTest {
 TEST_F(BgIterationTestCluster, dictIsOK) {
     // Just run the setup/teardown code to make sure the dict is OK.
 }
+
+
+TEST_F(BgIterationTestCluster, modFutureItem_YesReplication_YesConsistent_cluster) {
+    // Cluster test.  REPLICATION + CONSISTENT only supported in cluster mode
+    bgIterator *it = bgIteratorCreateFullScanIter("iter",
+            BGITERATOR_FLAG_REPLICATION | BGITERATOR_FLAG_CONSISTENT,
+            NULL, iteratorCleanupFn, PRIVDATA);
+    bgIteratorStatus status;
+
+    // For this test, don't read the 1st key - we only have 5 keys since not using DB[1]
+    bgIteration_feedIterators();    // Prime the feed - key 0 and 1 are now enqueued
+
+    // At this point, key 0, and 1 are queued.  Fake a modification to key 2 & 4 - two keys to ensure
+    //  that replication is ordered
+    client *c1 = getWriteClient(2, "xxx");
+    client *c2 = getWriteClient(4, "yyy");
+
+    // Since this is consistent, we will block the client, disallowing the write.
+    simulateBlockedWrite(c1);
+    simulateBlockedWrite(c2);
+
+    // On a consistent iterator, the event is expedited in-front of items already in queue!
+    //  Read keys 2&4 out of order.
+    expectReadKey(it, 2);  // reading original/unmodified item
+
+    // This call is expected to unblock the client waiting on #2
+    expectReadKeyWithUnblock(it, 4, nullptr, 2);  // reading original/unmodified item
+    simulateUnblockedWriteWithModification(c1);
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.replication_queued, 1u);
+    EXPECT_EQ(status.replication_processed, 0u);
+
+    // Now read items 0 and 1 - these were actually already queued before keys 1 & 4 were expedited.
+    // This call is expected to unblock the client waiting on #4
+    expectReadKeyWithUnblock(it, 0, nullptr, 4);
+    simulateUnblockedWriteWithModification(c2);
+    expectReadKey(it, 1);
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.replication_queued, 2u);
+    EXPECT_EQ(status.replication_processed, 0u);
+
+     // And now the 2 replications are queued
+    expectReadReplication(it, c1);
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.replication_queued, 2u);       // 1st replication still being processed
+    EXPECT_EQ(status.replication_processed, 0u);    //  (no change in these metrics yet)
+
+    expectReadReplication(it, c2);
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.replication_queued, 2u);
+    EXPECT_EQ(status.replication_processed, 1u);    // Done with 1st, processing 2nd
+
+     // Continue...
+    expectReadKey(it, 3);
+    bgIteratorGetStatus(it, &status);
+    EXPECT_EQ(status.replication_queued, 2u);
+    EXPECT_EQ(status.replication_processed, 2u);    // Done processing both repl items
+    expectReadComplete(it);
+    freeTestClient(c1);
+    freeTestClient(c2);
+}
 #endif
 
+
+
+// JHB - need test that hashing is paused when an entry is in use.
