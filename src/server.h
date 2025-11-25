@@ -254,6 +254,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define CMD_ALLOW_BUSY ((1ULL << 26))
 #define CMD_MODULE_GETCHANNELS (1ULL << 27) /* Use the modules getchannels interface. */
 #define CMD_TOUCHES_ARBITRARY_KEYS (1ULL << 28)
+#define CMD_WRITE_FIRSTKEY_ONLY (1ULL << 29)
 /* Command flags. Please don't forget to add command flag documentation in struct
  * serverCommand in this file. */
 
@@ -2552,6 +2553,9 @@ typedef int serverGetKeysProc(struct serverCommand *cmd, robj **argv, int argc, 
  *
  * CMD_TOUCHES_ARBITRARY_KEYS: The command may touch (and cause lazy-expire)
  *                             arbitrary key (i.e not provided in argv)
+ * 
+ * CMD_WRITE_FIRSTKEY_ONLY: The command must be CMD_WRITE.  It only modifies the first key.
+ *                          Other keys are read-only.  Example: SUNIONSTORE
  *
  * The following additional flags are only used in order to put commands
  * in a specific ACL category. Commands can have multiple ACL categories.
