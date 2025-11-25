@@ -682,12 +682,12 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
     /* Empty the database structure. */
     removed = emptyDbStructure(server.db, dbnum, async, callback);
 
-    if (dbnum == -1) flushReplicaKeysWithExpireList();
+    if (dbnum == -1) flushReplicaKeysWithExpireList(async);
 
     if (with_functions) {
         serverAssert(dbnum == -1);
         /* TODO: fix this callback incompatibility. The arg is not used. */
-        functionsLibCtxClearCurrent(async, (void (*)(dict *))callback);
+        functionReset(async, (void (*)(dict *))callback);
     }
 
     /* Also fire the end event. Note that this event will fire almost
@@ -1054,7 +1054,7 @@ void hashtableScanCallback(void *privdata, void *entry) {
         key = (sds)entry;
     } else if (o->type == OBJ_ZSET) {
         zskiplistNode *node = (zskiplistNode *)entry;
-        key = node->ele;
+        key = zslGetNodeElement(node);
         /* zset data is copied after filtering by key */
     } else if (o->type == OBJ_HASH) {
         key = entryGetField(entry);
@@ -1077,7 +1077,7 @@ void hashtableScanCallback(void *privdata, void *entry) {
     if (o->type == OBJ_ZSET) {
         /* zset data is copied */
         zskiplistNode *node = (zskiplistNode *)entry;
-        key = sdsdup(node->ele);
+        key = sdsdup(zslGetNodeElement(node));
         if (!data->only_keys) {
             char buf[MAX_LONG_DOUBLE_CHARS];
             int len = ld2string(buf, sizeof(buf), node->score, LD_STR_AUTO);
@@ -1796,7 +1796,7 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
     }
 
     trackingInvalidateKeysOnFlush(1);
-    flushReplicaKeysWithExpireList();
+    flushReplicaKeysWithExpireList(1);
 }
 
 /* SWAPDB db1 db2 */
