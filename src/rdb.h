@@ -185,6 +185,8 @@ enum RdbType {
 #define RDB_LOAD_ERR_UNKNOWN_TYPE 2 /* Unknown type in file */
 #define RDB_LOAD_ERR_OTHER 3        /* Any other errors */
 
+#define AMZ_RDB_AUX_REPL_PRIMARY_TIMESTAMP "amz-repl-master-time" // Not changing it to "amz-repl-primary-timestamp" for backward compatibility
+
 bool rdbIsVersionAccepted(int rdbver, bool is_valkey_magic, bool is_redis_magic);
 ssize_t rdbWriteRaw(rio *rdb, void *p, size_t len);
 int rdbSaveType(rio *rdb, unsigned char type);
@@ -225,5 +227,12 @@ int rdbSaveRio(int req, int rdbver, rio *rdb, int *error, int rdbflags, rdbSaveI
 ssize_t rdbSaveFunctions(rio *rdb);
 rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi);
 void replicationEmptyDbCallback(hashtable *ht);
+
+/* Threadsave helper functions */
+void rdbSetChecksumAlgorithmForSave(rio *rdb);
+sds rdbTempRdbFilename(const char *filename, pid_t pid);
+void rdbRemoveTempFilesForRDB(const char *filename, pid_t pid, bool from_signal);
+bool rdbTryWriteMd5File(rio *rdb, const char *filename);
+void rdbRemoveMd5FileForRDB(const char *filename);
 
 #endif
