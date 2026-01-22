@@ -559,7 +559,7 @@ ENGINE_SERVER_OBJ = \
     vset.o \
     ziplist.o \
     zipmap.o \
-    zmalloc.o bgiteration.o bgiteration_temp.o
+    zmalloc.o bgiteration.o bgiteration_temp.o threadsave.o
 ENGINE_SERVER_OBJ+=$(ENGINE_TRACE_OBJ)
 ENGINE_CLI_NAME=$(ENGINE_NAME)-cli$(PROG_SUFFIX)
 ENGINE_CLI_OBJ = \
