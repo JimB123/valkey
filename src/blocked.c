@@ -177,7 +177,7 @@ void processUnblockedClients(void) {
          * is blocked again. Actually processInputBuffer() checks that the
          * client is not blocked before to proceed, but things may change and
          * the code is conceptually more correct this way. */
-        if (!c->flag.blocked) {
+        if (!c->flag.blocked && !blockInuse_isBlockedClient(c) && !blockInuse_isUnblockedClient(c)) {
             /* If we have a queued command, execute it now. */
             if (processPendingCommandAndInputBuffer(c) == C_ERR) {
                 continue;

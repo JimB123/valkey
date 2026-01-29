@@ -59,6 +59,8 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms) {
         !mustObeyClient(c) && /* No timeout for primaries and AOF */
         !c->flag.blocked &&   /* No timeout for BLPOP */
         !c->flag.pubsub &&    /* No timeout for Pub/Sub clients */
+        !c->flag.blockInuse_blocked && /* No timeout for BlockInuse client */
+        !c->flag.blockInuse_unblocked && /* Client is unblocked, but we haven't yet processed the blocking command and input buffer, no timeout */
         (now - c->last_interaction > server.maxidletime)) {
         serverLog(LL_VERBOSE, "Closing idle client");
         freeClient(c);

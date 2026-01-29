@@ -1900,6 +1900,8 @@ void unlinkClient(client *c) {
     /* If this is marked as current client unset it. */
     if (c->conn && server.current_client == c) server.current_client = NULL;
 
+    blockInuse_unlinkClient(c);
+
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
      * conn is already set to NULL. */
@@ -1983,6 +1985,9 @@ void unlinkClient(client *c) {
 
     /* Clear the tracking status. */
     if (c->flag.tracking) disableTracking(c);
+
+    // We should never have a client here which is in blockInuse unblocked or blocked state.
+    serverAssert(!(blockInuse_isBlockedClient(c) || blockInuse_isUnblockedClient(c)));
 }
 
 /* Clear the client state to resemble a newly connected client. */

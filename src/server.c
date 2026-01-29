@@ -75,6 +75,7 @@
 #include <sys/utsname.h>
 #include <locale.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -1153,6 +1154,42 @@ void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage) {
     *out_usage = o;
 }
 
+// return 1 if client was terminated, 0 if still alive.
+static int clientsCronCheckBlockInuseClients(client *c) {
+    // Check for clients with no read/write handlers (blocked clients)
+    //  which have been closed from the remote side.
+    if (c->conn) {
+        // It's a normal client connection (not a fake client) ...
+        if (c->conn->type == connectionTypeTcp() || c->conn->type == connectionTypeTls()) {
+            // ... and it's based on a TCP socket ...
+            if (aeGetFileEvents(server.el, c->conn->fd) == AE_NONE) {
+                // ... and neither read nor write handler is installed ...
+                // Determine if the connection has been closed, from the far end, by
+                //  checking the TCP state information.
+                struct tcp_info info;
+                socklen_t infolen = sizeof(info);
+                // Query the kernal for TCP socket state info
+                // since no event handler exists, we must manally check if the connection is dead.
+    			if (getsockopt(c->conn->fd, IPPROTO_TCP, TCP_INFO, &info, &infolen) == 0) {
+                    // check TCP state
+                    if (info.tcpi_state == TCP_CLOSE_WAIT || info.tcpi_state == TCP_CLOSE) {
+                        // TCP_CLOSE_WAIT: remote side closed, local side hasn't closed yet
+                        // TCP_CLOSE: connection fully closed.
+                        if (server.verbosity <= LL_VERBOSE) {
+                            sds info = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
+                            serverLog(LL_VERBOSE, "Client closed connection while blocked %s", info);
+                            sdsfree(info);
+                        }
+                        freeClientAsync(c);
+                        return 1;   // client has been closed
+                    }
+				}
+            }
+        }
+    }
+    return 0;   // client has not been terminated
+}
+
 /* This function is called by clientsTimeProc() and is used in order to perform
  * operations on clients that are important to perform constantly. For instance
  * we use this function in order to disconnect clients after a timeout, including
@@ -1207,6 +1244,7 @@ static void clientsCron(int clients_this_cycle) {
         if (clientsCronResizeQueryBuffer(c)) continue;
         if (clientsCronResizeOutputBuffer(c, now)) continue;
         if (clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot)) continue;
+        if (clientsCronCheckBlockInuseClients(c)) continue;
 
         /* Iterating all the clients in getMemoryOverheadData() is too slow and
          * in turn would make the INFO command too slow. So we perform this
@@ -1942,6 +1980,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Close clients that need to be closed asynchronous */
     freeClientsInAsyncFreeQueue();
+
+    if (blockInuse_getNumberOfUnblockedClients() > 0) {
+        blockInuse_processServerBlockedClients();
+    }
 
     /* Incrementally trim replication backlog, 10 times the normal speed is
      * to free replication backlog as much as possible. */
@@ -2911,6 +2953,9 @@ void initServer(void) {
     server.client_mem_usage_buckets = NULL;
     server.debug_client_enforce_reply_list = 0;
     resetReplicationBuffer();
+
+    /* Init blockInuse */
+    blockInuse_init();
 
     /* Make sure the locale is set on startup based on the config file. */
     if (setlocale(LC_COLLATE, server.locale_collate) == NULL) {
@@ -4180,6 +4225,9 @@ void unprepareCommand(client *c) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
+
+    serverAssert(!(blockInuse_isBlockedClient(c) || blockInuse_isUnblockedClient(c)));
+
     if (!scriptIsTimedout()) {
         /* Both EXEC and scripts call call() directly so there should be
          * no way in_exec or scriptIsRunning() is 1.
@@ -4827,6 +4875,9 @@ int finishShutdown(void) {
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
+
+    /* Cleanup blockInuse data structures */
+    blockInuse_cleanDbBlockingInfo();
 
     moduleUnloadAllModules();
 
