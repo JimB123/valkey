@@ -76,6 +76,9 @@
 #include <locale.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#ifdef __APPLE__
+#include <netinet/tcp_fsm.h>
+#endif
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -1155,40 +1158,57 @@ void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage) {
     *out_usage = o;
 }
 
-// return 1 if client was terminated, 0 if still alive.
+/*
+ * Check if a blockInuse blocked client connection has been closed from the remote side.
+ *
+ * Returns:
+ *   1 if the client has been terminated,
+ *   0 if still alive.
+ */
 static int clientsCronCheckBlockInuseClients(client *c) {
-    // Check for clients with no read/write handlers (blocked clients)
-    //  which have been closed from the remote side.
-    if (c->conn) {
-        // It's a normal client connection (not a fake client) ...
-        if (c->conn->type == connectionTypeTcp() || c->conn->type == connectionTypeTls()) {
-            // ... and it's based on a TCP socket ...
-            if (aeGetFileEvents(server.el, c->conn->fd) == AE_NONE) {
-                // ... and neither read nor write handler is installed ...
-                // Determine if the connection has been closed, from the far end, by
-                //  checking the TCP state information.
-                struct tcp_info info;
-                socklen_t infolen = sizeof(info);
-                // Query the kernal for TCP socket state info
-                // since no event handler exists, we must manally check if the connection is dead.
-    			if (getsockopt(c->conn->fd, IPPROTO_TCP, TCP_INFO, &info, &infolen) == 0) {
-                    // check TCP state
-                    if (info.tcpi_state == TCP_CLOSE_WAIT || info.tcpi_state == TCP_CLOSE) {
-                        // TCP_CLOSE_WAIT: remote side closed, local side hasn't closed yet
-                        // TCP_CLOSE: connection fully closed.
-                        if (server.verbosity <= LL_VERBOSE) {
-                            sds info = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
-                            serverLog(LL_VERBOSE, "Client closed connection while blocked %s", info);
-                            sdsfree(info);
-                        }
-                        freeClientAsync(c);
-                        return 1;   // client has been closed
-                    }
-				}
-            }
+    if (!c->conn) return 0; // No connection, cannot check
+
+    // Only TCP or TLS clients are relevant
+    if (c->conn->type != connectionTypeTcp() && c->conn->type != connectionTypeTls()) return 0;
+
+    // If neither read nor write handler is installed, client is blocked.
+    if (aeGetFileEvents(server.el, c->conn->fd) != AE_NONE) return 0;
+
+        // No event handler exists, check TCP socket state.
+
+        /* TCP state introspection is platform-specific:
+         * - Linux: TCP_INFO / struct tcp_info
+         * - macOS: TCP_CONNECTION_INFO / struct tcp_connection_info (BSD TCP FSM)
+         */
+#if defined(__linux__)
+    struct tcp_info info;
+    socklen_t infolen = sizeof(info);
+    if (getsockopt(c->conn->fd, IPPROTO_TCP, TCP_INFO, &info, &infolen) != 0 || infolen < sizeof(info)) return 0; // Cannot retrieve TCP info
+
+    if (info.tcpi_state == TCP_CLOSE_WAIT ||
+        info.tcpi_state == TCP_CLOSE)
+#elif defined(__APPLE__)
+    struct tcp_connection_info info;
+    socklen_t infolen = sizeof(info);
+
+    if (getsockopt(c->conn->fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &infolen) != 0 || infolen < sizeof(info)) return 0; // Cannot retrieve TCP info
+
+    // Check if connection is closed or half-closed
+    if (info.tcpi_state == TCPS_CLOSE_WAIT ||
+        info.tcpi_state == TCPS_CLOSED)
+#endif
+    {
+        if (server.verbosity <= LL_VERBOSE) {
+            sds client_info = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
+            serverLog(LL_VERBOSE, "Client closed connection while blocked %s", client_info);
+            sdsfree(client_info);
         }
+
+        freeClientAsync(c);
+        return 1; // Client has been closed
     }
-    return 0;   // client has not been terminated
+
+    return 0; // Client is still alive
 }
 
 /* This function is called by clientsTimeProc() and is used in order to perform
@@ -2972,7 +2992,7 @@ void initServer(void) {
     server.debug_client_enforce_reply_list = 0;
     resetReplicationBuffer();
 
-    /* Init blockInuse */
+    /* Init blockInuse data structures */
     blockInuse_init();
 
     /* Make sure the locale is set on startup based on the config file. */
@@ -4257,8 +4277,7 @@ void unprepareCommand(client *c) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
-
-    serverAssert(!(blockInuse_isBlockedClient(c) || c->flag.unblocked == 1));
+    serverAssert(!(blockInuse_clientBlocked(c) || c->flag.unblocked == 1));
 
     if (!scriptIsTimedout()) {
         /* Both EXEC and scripts call call() directly so there should be
@@ -4908,7 +4927,7 @@ int finishShutdown(void) {
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
 
-    /* Cleanup blockInuse data structures */
+    /* Release blockInuse data structures. */
     blockInuse_release();
 
     moduleUnloadAllModules();
