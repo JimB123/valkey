@@ -1,9 +1,31 @@
 /*
-Harry TODO:
-1. write a brief introduction here
-2. remove unblocked client once done
-3. do we need the oldest?
-*/
+ * Copyright (c) Valkey Contributors
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Client blocking mechanism for keys currently in use by other operations.
+ *
+ * This module provides a specialized blocking system that prevents concurrent access to keys
+ * that are actively being modified or processed. Unlike the generic blocking operations in
+ * blocked.c (BLPOP, WAIT, etc.), this mechanism blocks clients when they attempt to access
+ * keys that are marked as "in use" by internal operations such as bgIteration.
+ *
+ * Key features:
+ * - Blocks clients on multiple keys simultaneously
+ * - Automatically unblocks clients when all their requested keys become available
+ * - Maintains bidirectional mappings: client->keys and key->clients
+ * - Integrates with the server's event loop via processServerBlockedClients()
+ * - Tracks blocking statistics and lifetime metrics
+ *
+ * Typical workflow:
+ * 1. blockInuse_blockClientOnKeys() - Block a client on a set of keys
+ * 2. Keys remain blocked until explicitly unblocked
+ * 3. blockInuse_unblockClientsOnKey() - Unblock specific key, triggering client resumption
+ * 4. blockInuse_processServerBlockedClients() - Process unblocked clients in beforeSleep()
+ *
+ * This is used to ensure data consistency during operations that require exclusive access
+ * to keys, preventing race conditions and maintaining transactional integrity.
+ */
 
 #ifndef BLOCKED_INUSE_H__
 #define BLOCKED_INUSE_H__
@@ -12,28 +34,19 @@ Harry TODO:
 #include "adlist.h"
 
 struct robj;                     //defined in server.h
-struct serverCommand;            //defined in server.h
 struct client;                   //defined in server.h
 
-/* Check if client is blocked/unblocked by blockInuse */
+/* Check if client is blocked by blockInuse */
 #define blockInuse_isBlockedClient(c) ((c)->flag.blockInuse_blocked)
-#define blockInuse_isUnblockedClient(c) ((c)->flag.blockInuse_unblocked)
 
-// Harry Check: do I need them in here, since they are totally private now.
-typedef struct blockInuse_clientMetadata blockInuse_clientMetadata;
-typedef struct blockInuse_blockingInfo blockInuse_blockingInfo;
-
-/* Initialize global blockInuse structures. Call once at server startup. */
+/* Initialize blockInuse structures. Call once at server startup. */
 void blockInuse_init(void);
 
-/* If no clients are blocked and all the previously blocked clients have processed the blocked command,
-   then this will free the data structures and return true. Otherwise, this will return false, and we
-   still have few clients to process and cleanup failed. */
-bool blockInuse_cleanDbBlockingInfo(void);
+/* Free blockInuse data structures, no clients should be blocked by blockInuse at this time. */
+void blockInuse_release(void);
 
 /* Returns the total count of currently blocked clients by blockInuse */
 int blockInuse_getNumberOfBlockedClients(void);
-long blockInuse_getNumberOfUnblockedClients(void);
 
 /*
  * Block given client on set of keys. Duplicated keys are handled.

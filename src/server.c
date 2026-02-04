@@ -1981,10 +1981,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Close clients that need to be closed asynchronous */
     freeClientsInAsyncFreeQueue();
 
-    if (blockInuse_getNumberOfUnblockedClients() > 0) {
-        blockInuse_processServerBlockedClients();
-    }
-
     /* Incrementally trim replication backlog, 10 times the normal speed is
      * to free replication backlog as much as possible. */
     if (server.repl_backlog) incrementalTrimReplicationBacklog(10 * REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
@@ -4226,7 +4222,7 @@ void unprepareCommand(client *c) {
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
 
-    serverAssert(!(blockInuse_isBlockedClient(c) || blockInuse_isUnblockedClient(c)));
+    serverAssert(!(blockInuse_isBlockedClient(c) || c->flag.unblocked == 1));
 
     if (!scriptIsTimedout()) {
         /* Both EXEC and scripts call call() directly so there should be
@@ -4877,7 +4873,7 @@ int finishShutdown(void) {
     closeListeningSockets(1);
 
     /* Cleanup blockInuse data structures */
-    blockInuse_cleanDbBlockingInfo();
+    blockInuse_release();
 
     moduleUnloadAllModules();
 

@@ -1,28 +1,26 @@
 #include "server.h"
-#include "hashtable.h"
 #include "blocked_inuse.h"
 
-/* External functions from server.c */
+/* External hashtable functions from server.c */
 extern uint64_t dictEncObjHash(const void *key);
 extern int hashtableEncObjKeyCompare(const void *key1, const void *key2);
 extern uint64_t hashtableClientHash(const void *key);
 extern int hashtableClientKeyCompare(const void *key1, const void *key2);
 
-static hashtable *client_to_keys; // client memory address -> blockInuse_clientMetadata (contains a list of keys)
-static hashtable *key_to_clients; /* Map(key)->list(blocked clients).  */
-static list *unblocked_clients;    /* list of clients which are unblocked. We need to resume the blocked command and then process the unread querybuf before we remove it.*/
-uint32_t blocked_clients_on_keys;                                 /* Num of clients blocked on keys now. */
-uint32_t total_clients_blocked_on_keys_lifetime;                  /* Num of clients blocked on keys lifetime. */
-uint32_t total_clients_unblocked_on_keys_lifetime;                /* Num of clients unblocked on keys lifetime. */
-uint32_t total_clients_resumed_lifetime;                          /* Num of clients resumed lifetime. */
+// Internal blockInuse data structure
+static hashtable *client_to_keys;                               /* Map(client memory address) -> blockInuse_clientMetadata (contains a list of keys). */
+static hashtable *key_to_clients;                               /* Map(key)->list(blocked clients).  */
+uint32_t blocked_clients_on_keys;                               /* Num of clients blocked on keys now. */
+uint32_t blockInuse_total_clients_blocked_on_keys_lifetime;     /* Num of clients blocked on keys lifetime. */
+uint32_t blockInuse_total_clients_unblocked_on_keys_lifetime;   /* Num of clients unblocked on keys lifetime. */
 
 typedef struct blockInuse_clientMetadata {
     robj **keys;                        /* Keys this client is blocked on. */
-    int n_keys;                         /* number of keys this client is blocked on. */
-    long long blocked_at;               /* what time this client is blocked in milli second. It uses value from server.mstime. */
+    int n_keys;                         /* Number of keys this client is blocked on. */
+    long long blocked_at;               /* What time this client is blocked in milli second. It uses value from server.mstime. */
 } blockInuse_clientMetadata;
 
-/* ----------------------------- client_to_keys Hashtable Util ------------------------- */
+/* ----------------------------- client_to_keys Hashtable util ------------------------- */
 typedef struct {
     client *c;
     blockInuse_clientMetadata metadata;
@@ -79,7 +77,7 @@ static void removeClientMetadata(client *c) {
 }
 
 
-/* ----------------------------- keyToClientsEntry Hashtable Util ------------------------- */
+/* ----------------------------- key_to_clients Hashtable Util ------------------------- */
 /* Entry type for key_to_clients: robj key -> list of clients */
 typedef struct {
     robj *key;
@@ -104,6 +102,7 @@ static hashtableType keyToClientsHashtableType = {
     .entryDestructor = keyToClientsDestructor,
 };
 
+/* Utility functions for key_to_clients hashtable */
 static list *addOrFindBlockedClientsListsByKey(robj *key) {
     keyToClientsEntry *entry;
     if (hashtableFind(key_to_clients, key, (void **)&entry)) {
@@ -136,12 +135,7 @@ static void markClientBlocked(client *c) {
     c->flag.pending_command = 1; // Harrt TODO do we need this, and why?
 }
 
-static void markClientUnblocked(client *c) {
-    c->flag.blockInuse_blocked = 0;
-    c->flag.blockInuse_unblocked = 1;
-}
-
-// Init the client Metadata and insert it into our global hash table, key is client, and value is metadata
+// Init the client Metadata and insert it into client_to_keys hash table.
 static blockInuse_clientMetadata *initClientMetadata(client *c, int nKeys) {
     serverAssert(!getClientMetadata(c)); // this client must not be in our global table
     serverAssert(nKeys >= 0); // non negative check
@@ -172,8 +166,7 @@ static void unlinkBlockedClientOnKeys(client *c) {
     }
     metadata->n_keys = 0;
     blocked_clients_on_keys--;
-    total_clients_unblocked_on_keys_lifetime++;
-    total_clients_resumed_lifetime++; // Harry TODO why ??
+    blockInuse_total_clients_unblocked_on_keys_lifetime++;
 }
 
 // Remove a key from a client entry in client_to_keys table
@@ -195,21 +188,6 @@ static blockInuse_clientMetadata *removeBlockingKeyFromClient(client *c, robj *k
     serverAssert(false);
 }
 
-/* Process all the commands for an unblocked client. First we read the blocked command which is already parsed by calling processCommand.
- * Then we process the commands present in querybuf by calling processInputBuffer.
- */
-static void processBlockedCommand(client *c) {
-    if (c->flag.close_asap) return;
-    c->flag.pending_command = 0;
-    int retval = processCommandAndResetClient(c);
-    if (retval != C_OK || blockInuse_isBlockedClient(c)) {
-        return;
-    }
-    //process the pending commands in the buffer.
-    if (processInputBuffer(c) == C_OK && !c->flag.close_asap) {
-        beforeNextClient(c);
-    }
-}
 /* ----------------------------- API implementation ------------------------- */
 
 /* Initialize global client_to_keys hashtable. Call once at server startup. */
@@ -218,24 +196,19 @@ static void processBlockedCommand(client *c) {
 void blockInuse_init(void) {
     client_to_keys = hashtableCreate(&clientDataHashtableType);
     key_to_clients = hashtableCreate(&keyToClientsHashtableType);
-    unblocked_clients = listCreate();
     blocked_clients_on_keys = 0;
-    total_clients_blocked_on_keys_lifetime = 0;
-    total_clients_unblocked_on_keys_lifetime = 0;
-    total_clients_resumed_lifetime = 0;
+    blockInuse_total_clients_blocked_on_keys_lifetime = 0;
+    blockInuse_total_clients_unblocked_on_keys_lifetime = 0;
 }
 
 /* Clean up the blockInuse data structures for the database if possible.
  * Returns false if there are any blocked or unblocked clients (no cleanup performed).
  * Returns true if cleanup succeeded or was already done.
  * Note: This will not free the struct itself but cleans up the internal data. */
-// Harry check Done
-bool blockInuse_cleanDbBlockingInfo(void) {
-    if (blocked_clients_on_keys > 0 || (listLength(unblocked_clients) > 0)) return false;
+void blockInuse_release(void) {
+    serverAssert(blocked_clients_on_keys == 0);
     hashtableRelease(key_to_clients);
-    listRelease(unblocked_clients);
     key_to_clients = NULL;
-    unblocked_clients = NULL;
     blocked_clients_on_keys = 0;
     return true;
 }
@@ -245,14 +218,10 @@ int blockInuse_getNumberOfBlockedClients(void) {
     return blocked_clients_on_keys;
 }
 
-long blockInuse_getNumberOfUnblockedClients(void) {
-    return listLength(unblocked_clients);
-}
-
 // Harry check Done
 int blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]) {
     // some checks
-    serverAssert(!(blockInuse_isBlockedClient(c) || blockInuse_isUnblockedClient(c)));
+    serverAssert(!(blockInuse_isBlockedClient(c) || (c)->flag.unblocked));
     if (nKeys == 0) return C_ERR;
     if (c->flag.replica) return C_ERR; // Maybe remove this?
     for (int i = 0; i < nKeys; ++i) {
@@ -290,7 +259,7 @@ int blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]) {
         connSetReadHandler(c->conn, NULL);
     }
     blocked_clients_on_keys++;
-    total_clients_blocked_on_keys_lifetime++;
+    blockInuse_total_clients_blocked_on_keys_lifetime++;
     return C_OK;
 }
 
@@ -304,16 +273,22 @@ void blockInuse_unblockClientsOnKey(robj *key) {
         listNode *ln = listFirst(blockedClientsList);
         client *c = listNodeValue(ln);
         listDelNode(blockedClientsList, ln);
+        // remove a key for a specific client in client_to_keys
         blockInuse_clientMetadata *metadata = removeBlockingKeyFromClient(c, key);
         if (metadata->n_keys == 0) {
             // time to remove this entry in our global table
-            markClientUnblocked(c);
+            serverAssert(c->flag.unblocked == 0);
+            if (!c->flag.unblocked) {
+                c->flag.unblocked = 1;
+                listAddNodeTail(server.unblocked_clients, c);
+            }
             removeClientMetadata(c);
-            listAddNodeTail(unblocked_clients, c);
             blocked_clients_on_keys--;
-            total_clients_blocked_on_keys_lifetime++;
+            blockInuse_total_clients_blocked_on_keys_lifetime++;
         }
     }
+
+    // remove from key_to_clients
     removeBlockedClientsListsByKey(key);
 }
 
@@ -332,48 +307,34 @@ void blockInuse_unblockClientsOnAllKeys(void) {
     hashtableCleanupIterator(&iter);
 }
 
-// Harry check Done
-void blockInuse_processServerBlockedClients(void) {
-    if(!unblocked_clients) return;
-
-    while(listLength(unblocked_clients) > 0) {
-        // we need to check it every time, so that if one of the unblocked
-        // clients executed pause command, then we stop processing further.
-        if (isPausedActionsWithUpdate(PAUSE_ACTIONS_CLIENT_ALL_SET)) return;
-        listNode *ln = listFirst(unblocked_clients);
-        serverAssert(ln != NULL);
-        client *c = listNodeValue(ln);
-        listDelNode(unblocked_clients, ln);
-        c->flag.blockInuse_unblocked = 0;
-        total_clients_resumed_lifetime++;
-        // make the fd readble again. This should succeed as we are not adding a
-        // new client. If it fails because epoll_ctl failed then freeClient.
-        // We avoid setting the read handler for fake client that does not have a connection.
-        if (c->conn && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
-            freeClient(c);
-            return;
-        }
-        processBlockedCommand(c);
+// Harry check TODO
+int blockInuse_processUnblockClients(client *c) {
+    /* Process all the commands for an unblocked client. First we read the blocked command which is already parsed by calling processCommand.
+    * Then we process the commands present in querybuf by calling processInputBuffer.
+    */
+    if (c->flag.close_asap) return;
+    c->flag.pending_command = 0;
+    int retval = processCommandAndResetClient(c);
+    if (retval != C_OK || blockInuse_isBlockedClient(c)) {
+        return;
+    }
+    //process the pending commands in the buffer.
+    if (processInputBuffer(c) == C_OK && !c->flag.close_asap) {
+        beforeNextClient(c);
     }
 }
 
 // Harry check Done
-// remove a client from everywhere
+// remove a client from the tables, the client must be blocked before calling
 void blockInuse_unlinkClient(client *c) {
-    serverAssert(blockInuse_isBlockedClient(c) || blockInuse_isUnblockedClient(c));
-    if (blockInuse_isBlockedClient(c)) {
-        blockInuse_clientMetadata *metadata = getClientMetadata(c);
-        if (metadata == NULL) return; // return immediately if the client was not blocked on any keys.
-        unlinkBlockedClientOnKeys(c);
-        c->flag.blockInuse_blocked = 0;
-        removeClientMetadata(c); // remove the global hashtable entry
-    }
+    serverAssert(blockInuse_isBlockedClient(c));
+    blockInuse_clientMetadata *metadata = getClientMetadata(c);
+    if (metadata == NULL) return; // return immediately if the client was not blocked on any keys.
 
-    if (blockInuse_isUnblockedClient(c)) {
-        listNode *ln = listSearchKey(unblocked_clients, c);
-        serverAssert(ln != NULL);
-        listDelNode(unblocked_clients, ln);
-        c->flag.blockInuse_unblocked = 0;
-        total_clients_resumed_lifetime++;
-    }
+    // remove from key_to_clients
+    unlinkBlockedClientOnKeys(c);
+
+    // remove from client_to_keys
+    c->flag.blockInuse_blocked = 0;
+    removeClientMetadata(c); // remove the global hashtable entry
 }

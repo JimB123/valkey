@@ -1986,8 +1986,8 @@ void unlinkClient(client *c) {
     /* Clear the tracking status. */
     if (c->flag.tracking) disableTracking(c);
 
-    // We should never have a client here which is in blockInuse unblocked or blocked state.
-    serverAssert(!(blockInuse_isBlockedClient(c) || blockInuse_isUnblockedClient(c)));
+    // We should never have a client here which is in unblocked or blockInuse blocked state.
+    serverAssert(!(blockInuse_isBlockedClient(c) || (c)->flag.unblocked));
 }
 
 /* Clear the client state to resemble a newly connected client. */

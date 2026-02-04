@@ -160,6 +160,9 @@ void processUnblockedClients(void) {
     client *c;
 
     while (listLength(server.unblocked_clients)) {
+        // we need to check it every time, so that if one of the unblocked
+        // clients executed pause command, then we stop processing further.
+        if (isPausedActionsWithUpdate(PAUSE_ACTIONS_CLIENT_ALL_SET)) return;
         ln = listFirst(server.unblocked_clients);
         serverAssert(ln != NULL);
         c = ln->value;
@@ -173,17 +176,28 @@ void processUnblockedClients(void) {
             continue;
         }
 
+        if (blockInuse_isBlockedClient(c)) {
+            c->flag.blockInuse_unblocked = 0;
+            // make the fd readble again. This should succeed as we are not adding a
+            // new client. If it fails because epoll_ctl failed then freeClient.
+            // We avoid setting the read handler for fake client that does not have a connection.
+            if (c->conn && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+                freeClient(c);
+                return;
+            }
+            if (c->flag.close_asap) return; // maybe move out of the if?
+        }
         /* Process remaining data in the input buffer, unless the client
          * is blocked again. Actually processInputBuffer() checks that the
          * client is not blocked before to proceed, but things may change and
          * the code is conceptually more correct this way. */
-        if (!c->flag.blocked && !blockInuse_isBlockedClient(c) && !blockInuse_isUnblockedClient(c)) {
+        if (!c->flag.blocked && !blockInuse_isBlockedClient(c)) {
             /* If we have a queued command, execute it now. */
             if (processPendingCommandAndInputBuffer(c) == C_ERR) {
                 continue;
             }
         }
-        beforeNextClient(c);
+        if (c) beforeNextClient(c);
     }
 }
 
