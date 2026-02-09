@@ -3905,9 +3905,14 @@ void bgsaveCommand(client *c) {
             }
             /* Terminates an in progress BGSAVE */
             if (server.child_type == CHILD_TYPE_RDB) {
-                /* There is an ongoing bgsave */
+                /* There is an ongoing fork-based bgsave */
                 serverLog(LL_NOTICE, "Background saving will be aborted due to user request");
                 killRDBChild();
+                addReplyStatus(c, "Background saving cancelled");
+            } else if (isSaveInProgress()) {
+                /* Save in progress that does not use a child process means threadsave is in progress */
+                serverLog(LL_NOTICE, "Background saving (thread) will be aborted due to user request");
+                threadsaveCancel();
                 addReplyStatus(c, "Background saving cancelled");
             } else if (server.rdb_bgsave_scheduled == 1) {
                 serverLog(LL_NOTICE, "Scheduled background saving will be cancelled due to user request");
