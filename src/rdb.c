@@ -1702,6 +1702,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         serverLog(LL_NOTICE, "Background saving started by pid %ld", (long)childpid);
         server.rdb_save_time_start = time(NULL);
         server.rdb_child_type = RDB_CHILD_TYPE_DISK;
+        server.cur_bgsave_type = RDB_BGSAVE_TYPE_FORK;
         return C_OK;
     }
     return C_OK; /* unreached */
@@ -3611,9 +3612,11 @@ static void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t sav
         server.dirty = server.dirty - server.dirty_before_bgsave;
         server.lastsave = save_end;
         server.lastbgsave_status = C_OK;
+        server.lastbgsave_type = RDB_BGSAVE_TYPE_FORK;
     } else if (!bysignal && exitcode != 0) {
         serverLog(LL_WARNING, "Background saving error");
         server.lastbgsave_status = C_ERR;
+        server.lastbgsave_type = RDB_BGSAVE_TYPE_FORK;
     } else {
         mstime_t latency;
 
@@ -3668,6 +3671,7 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
     }
 
     server.rdb_child_type = RDB_CHILD_TYPE_NONE;
+    server.cur_bgsave_type = RDB_BGSAVE_TYPE_NONE;
     server.rdb_save_time_last = save_end - server.rdb_save_time_start;
     server.rdb_save_time_start = -1;
     /* Possibly there are replicas waiting for a BGSAVE in order to be served
@@ -3909,8 +3913,8 @@ void bgsaveCommand(client *c) {
                 serverLog(LL_NOTICE, "Background saving will be aborted due to user request");
                 killRDBChild();
                 addReplyStatus(c, "Background saving cancelled");
-            } else if (isSaveInProgress()) {
-                /* Save in progress that does not use a child process means threadsave is in progress */
+            } else if (server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD) {
+                /* There is an ongoing threadsave */
                 serverLog(LL_NOTICE, "Background saving (thread) will be aborted due to user request");
                 threadsaveCancel();
                 addReplyStatus(c, "Background saving cancelled");
