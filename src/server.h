@@ -3311,6 +3311,7 @@ void receiveChildInfo(void);
 /* Fork helpers */
 int serverFork(int purpose);
 int hasActiveChildProcess(void);
+int isSaveInProgress(void);
 void resetChildState(void);
 int isMutuallyExclusiveChildType(int type);
 
