@@ -3876,7 +3876,7 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
 }
 
 void saveCommand(client *c) {
-    if (server.child_type == CHILD_TYPE_RDB) {
+    if (server.child_type == CHILD_TYPE_RDB || server.cur_bgsave_type != RDB_BGSAVE_TYPE_NONE) {
         addReplyError(c, "Background save already in progress");
         return;
     }
@@ -3939,7 +3939,7 @@ void bgsaveCommand(client *c) {
     rdbSaveInfo rsi, *rsiptr;
     rsiptr = rdbPopulateSaveInfo(&rsi);
 
-    if (server.child_type == CHILD_TYPE_RDB) {
+    if (server.child_type == CHILD_TYPE_RDB || server.cur_bgsave_type != RDB_BGSAVE_TYPE_NONE) {
         addReplyError(c, "Background save already in progress");
     } else if (hasActiveChildProcess() || server.in_exec) {
         if (schedule || server.in_exec) {
