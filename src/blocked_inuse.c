@@ -154,6 +154,7 @@ static void removeBlockedClientsListsByKey(robj *key) {
 /* ----------------------------- util ------------------------- */
 
 static void markClientBlocked(client *c) {
+    serverAssert(c->flag.blocked == 0);
     c->flag.blockInuse_blocked = 1;
     c->flag.pending_command = 1;
 }
@@ -226,6 +227,11 @@ static blockInuse_clientMetadata *removeBlockingKeyFromClient(client *c, robj *k
 
 /* ----------------------------- API implementation ------------------------- */
 
+/* Check if client is blocked by blockInuse */
+int blockInuse_clientBlocked(client *c) {
+    return c->flag.blockInuse_blocked;
+}
+
 /*
  * Initialize blockInuse data structures.
  */
@@ -259,14 +265,12 @@ int blockInuse_getNumberOfBlockedClients(void) {
 }
 
 /* Block a client on a set of keys. */
-int blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]) {
-    // Ensure client is not already blocked or unblocked
+void blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]) {
     serverAssert(!(blockInuse_clientBlocked(c) || (c)->flag.unblocked));
-
-    if (nKeys == 0) return C_ERR;
-    if (c->flag.replica) return C_ERR;
+    serverAssert(nKeys > 0);
+    serverAssert(!c->flag.replica);
     for (int i = 0; i < nKeys; ++i) {
-        if (keys[i]->type != OBJ_STRING) return C_ERR;
+        serverAssert(keys[i]->type == OBJ_STRING);
     }
 
     // Initialize client metadata and insert into client_to_keys table
@@ -297,7 +301,6 @@ int blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]) {
         connSetReadHandler(c->conn, NULL);
     }
     blocked_clients_on_keys++;
-    return C_OK;
 }
 
 /*
@@ -327,6 +330,7 @@ void blockInuse_unblockClientsOnKey(robj *key) {
             // Client has no more blocked keys → mark unblocked
             serverAssert(c->flag.unblocked == 0);
             c->flag.unblocked = 1;
+            c->flag.blockInuse_blocked = 0;
             listAddNodeTail(server.unblocked_clients, c);
 
             // Remove client metadata from client_to_keys table

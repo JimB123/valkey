@@ -36,14 +36,11 @@
 #ifndef BLOCKED_INUSE_H__
 #define BLOCKED_INUSE_H__
 
-#include "hashtable.h"
-#include "adlist.h"
-
 struct robj;   // defined in server.h
 struct client; // defined in server.h
 
 /* Check if client is blocked by blockInuse */
-#define blockInuse_clientBlocked(c) ((c)->flag.blockInuse_blocked)
+int blockInuse_clientBlocked(client *c);
 
 /* Initialize blockInuse structures, must be called once during server startup. */
 void blockInuse_init(void);
@@ -58,20 +55,8 @@ int blockInuse_getNumberOfBlockedClients(void);
  * Block a client on a set of keys. Duplicate keys are allowed and handled.
  *
  * To avoid extra copying, this API keeps references to the passed key objects.
- * The caller must ensure that the `keys` array and all key objects are
- * heap-allocated and remain valid for the duration of the block.
- *
- * Preconditions:
- *  - The client must not already have any blocked or unblocked flags set.
- *
- * Return value:
- *  - C_ERR if:
- *      a. nKeys == 0
- *      b. any key is not a sds string object
- *      c. the client is a replica client
- *  - C_OK otherwise; the client is blocked until all keys are unblocked.
  */
-int blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]);
+void blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]);
 
 /*
  * Unblock clients blocked on the given key.
@@ -92,10 +77,9 @@ void blockInuse_unblockClientsOnAllKeys(void);
 
 /*
  * Unlink a client currently blocked by blockInuse. Typically used when
- * a client is being freed while still blocked (e.g., due to memory pressure).
+ * a client is being freed while still blocked (e.g., client-initiated disconnect).
  *
- * This function removes the client from all blockInuse data structures
- * and clears its blockInuse blocked flag.
+ * This function removes the client from all blockInuse data structures.
  */
 void blockInuse_unlinkClient(client *c);
 

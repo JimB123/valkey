@@ -70,6 +70,7 @@
 #include "monotonic.h"
 #include "cluster_slot_stats.h"
 #include "module.h"
+#include "blocked_inuse.h"
 
 /* forward declarations */
 static void unblockClientWaitingData(client *c);
@@ -166,6 +167,7 @@ void processUnblockedClients(void) {
         serverAssert(ln != NULL);
         c = ln->value;
         listDelNode(server.unblocked_clients, ln);
+        serverAssert(!blockInuse_clientBlocked(c));
         c->flag.unblocked = 0;
 
         if (c->flag.module) {
@@ -175,9 +177,10 @@ void processUnblockedClients(void) {
             continue;
         }
 
-        if (blockInuse_clientBlocked(c)) {
-            // Enable the read handler. If it fails because epoll_ctl failed then freeClient.
-            if (c->conn && connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
+        /* Reinstall read handler if it was removed (e.g. by blockInuse) */
+        if (c->conn && !connHasReadHandler(c->conn)) {
+            // If it fails because epoll_ctl failed then freeClient.
+            if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
                 freeClient(c);
                 return;
             }
@@ -186,13 +189,13 @@ void processUnblockedClients(void) {
          * is blocked again. Actually processInputBuffer() checks that the
          * client is not blocked before to proceed, but things may change and
          * the code is conceptually more correct this way. */
-        if (!c->flag.blocked && !blockInuse_clientBlocked(c)) {
+        if (!c->flag.blocked) {
             /* If we have a queued command, execute it now. */
             if (processPendingCommandAndInputBuffer(c) == C_ERR) {
                 continue;
             }
         }
-        if (c && !c->flag.close_asap) beforeNextClient(c);
+        if (!c->flag.close_asap) beforeNextClient(c);
     }
 }
 

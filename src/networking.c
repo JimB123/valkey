@@ -40,6 +40,7 @@
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
+#include "blocked_inuse.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -1902,7 +1903,7 @@ void unlinkClient(client *c) {
     waitForClientIO(c);
 
     /* If this is marked as current client unset it. */
-    if (c->conn && server.current_client == c) server.current_client = NULL;
+    if (server.current_client == c) server.current_client = NULL;
 
     if (blockInuse_clientBlocked(c)) blockInuse_unlinkClient(c);
 
@@ -1990,7 +1991,7 @@ void unlinkClient(client *c) {
     /* Clear the tracking status. */
     if (c->flag.tracking) disableTracking(c);
 
-    // Here client should never in unblocked or blockInuse blocked state.
+    // Client should never in unblocked or blockInuse blocked state.
     serverAssert(!(blockInuse_clientBlocked(c) || (c)->flag.unblocked));
 }
 
@@ -4281,7 +4282,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (client->flag.pubsub) *p++ = 'P';
     if (client->flag.multi) *p++ = 'x';
     if (client->flag.blocked) *p++ = 'b';
-    if (client->flag.blockInuse_blocked) *p++ = 'X';
+    if (blockInuse_clientBlocked(client)) *p++ = 'X';
     if (client->flag.tracking) *p++ = 't';
     if (client->flag.tracking_broken_redir) *p++ = 'R';
     if (client->flag.tracking_bcast) *p++ = 'B';

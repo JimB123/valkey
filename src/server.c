@@ -48,6 +48,7 @@
 #include "fmtargs.h"
 #include "io_threads.h"
 #include "tls.h"
+#include "blocked_inuse.h"
 #include "sds.h"
 #include "module.h"
 #include "scripting_engine.h"
@@ -1159,45 +1160,36 @@ void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage) {
 }
 
 /*
- * Check if a blockInuse blocked client connection has been closed from the remote side.
+ * Check if a TCP client connection has been closed from the remote side.
  *
  * Returns:
- *   1 if the client has been terminated,
- *   0 if still alive.
+ *   true if the client has been terminated,
+ *   false if still alive.
  */
-static int clientsCronCheckBlockInuseClients(client *c) {
-    if (!c->conn) return 0; // No connection, cannot check
+static bool clientsCronTcpIsClosing(client *c) {
+    if (!c->conn) return false; // No connection, cannot check
 
     // Only TCP or TLS clients are relevant
-    if (c->conn->type != connectionTypeTcp() && c->conn->type != connectionTypeTls()) return 0;
+    if (c->conn->type != connectionTypeTcp() && c->conn->type != connectionTypeTls()) return false;
 
-    // If neither read nor write handler is installed, client is blocked.
-    if (aeGetFileEvents(server.el, c->conn->fd) != AE_NONE) return 0;
+    // Skip if event handlers are installed
+    if (aeGetFileEvents(server.el, c->conn->fd) != AE_NONE) return false;
 
-        // No event handler exists, check TCP socket state.
-
-        /* TCP state introspection is platform-specific:
-         * - Linux: TCP_INFO / struct tcp_info
-         * - macOS: TCP_CONNECTION_INFO / struct tcp_connection_info (BSD TCP FSM)
-         */
 #if defined(__linux__)
+    // Check TCP socket state using Linux TCP_INFO
     struct tcp_info info;
     socklen_t infolen = sizeof(info);
-    if (getsockopt(c->conn->fd, IPPROTO_TCP, TCP_INFO, &info, &infolen) != 0 || infolen < sizeof(info)) return 0; // Cannot retrieve TCP info
-
-    if (info.tcpi_state == TCP_CLOSE_WAIT ||
-        info.tcpi_state == TCP_CLOSE)
+    if (getsockopt(c->conn->fd, IPPROTO_TCP, TCP_INFO, &info, &infolen) != 0 || infolen < sizeof(info)) return false; // Cannot retrieve TCP info
+    bool connection_is_closing = (info.tcpi_state == TCP_CLOSE_WAIT || info.tcpi_state == TCP_CLOSE);
 #elif defined(__APPLE__)
+    // Check TCP socket state using macOS TCP_CONNECTION_INFO
     struct tcp_connection_info info;
     socklen_t infolen = sizeof(info);
-
-    if (getsockopt(c->conn->fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &infolen) != 0 || infolen < sizeof(info)) return 0; // Cannot retrieve TCP info
-
-    // Check if connection is closed or half-closed
-    if (info.tcpi_state == TCPS_CLOSE_WAIT ||
-        info.tcpi_state == TCPS_CLOSED)
+    if (getsockopt(c->conn->fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &infolen) != 0 || infolen < sizeof(info)) return false; // Cannot retrieve TCP info
+    bool connection_is_closing = (info.tcpi_state == TCPS_CLOSE_WAIT || info.tcpi_state == TCPS_CLOSED);
 #endif
-    {
+
+    if (connection_is_closing) {
         if (server.verbosity <= LL_VERBOSE) {
             sds client_info = catClientInfoString(sdsempty(), c, server.hide_user_data_from_log);
             serverLog(LL_VERBOSE, "Client closed connection while blocked %s", client_info);
@@ -1205,10 +1197,10 @@ static int clientsCronCheckBlockInuseClients(client *c) {
         }
 
         freeClientAsync(c);
-        return 1; // Client has been closed
+        return true; // Client has been closed
     }
 
-    return 0; // Client is still alive
+    return false; // Client is still alive
 }
 
 /* This function is called by clientsTimeProc() and is used in order to perform
@@ -1265,7 +1257,7 @@ static void clientsCron(int clients_this_cycle) {
         if (clientsCronResizeQueryBuffer(c)) continue;
         if (clientsCronResizeOutputBuffer(c, now)) continue;
         if (clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot)) continue;
-        if (clientsCronCheckBlockInuseClients(c)) continue;
+        if (clientsCronTcpIsClosing(c)) continue;
 
         /* Iterating all the clients in getMemoryOverheadData() is too slow and
          * in turn would make the INFO command too slow. So we perform this
@@ -2992,9 +2984,6 @@ void initServer(void) {
     server.debug_client_enforce_reply_list = 0;
     resetReplicationBuffer();
 
-    /* Init blockInuse data structures */
-    blockInuse_init();
-
     /* Make sure the locale is set on startup based on the config file. */
     if (setlocale(LC_COLLATE, server.locale_collate) == NULL) {
         if (server.locale_collate[0] == '\0') {
@@ -3140,6 +3129,7 @@ void initServer(void) {
 
     commandlogInit();
     latencyMonitorInit();
+    blockInuse_init();
     initSharedQueryBuf();
 
     /* Initialize ACL default password if it exists */
@@ -4277,7 +4267,7 @@ void unprepareCommand(client *c) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
-    serverAssert(!(blockInuse_clientBlocked(c) || c->flag.unblocked == 1));
+    serverAssert(!(blockInuse_clientBlocked(c) || c->flag.unblocked == 1 || c->flag.blocked == 1));
 
     if (!scriptIsTimedout()) {
         /* Both EXEC and scripts call call() directly so there should be
@@ -4927,7 +4917,6 @@ int finishShutdown(void) {
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
 
-    /* Release blockInuse data structures. */
     blockInuse_release();
 
     moduleUnloadAllModules();
