@@ -83,7 +83,6 @@
 #include "trace/trace.h"
 #include "entry.h"
 #include "lrulfu.h"
-#include "blocked_inuse.h"
 
 /*
  * Sanity check: we require large-file support. If include order caused

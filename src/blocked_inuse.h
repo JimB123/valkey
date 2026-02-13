@@ -18,60 +18,70 @@
  *     available
  *   - Maintains bidirectional mappings: client->keys and key->clients
  *   - Integrates with the server's event loop via processUnblockedClients()
- *     in blocked.c
  *
  * Workflow:
- *   1. blockInuse_blockClientOnKeys() - Block a client on a set of keys
- *   2. Keys remain blocked until explicitly unblocked
- *   3. blockInuse_unblockClientsOnKey() - Unblock specific key, triggering
- *      clients resumption
- *   4. processUnblockedClients() - Process unblocked clients in beforeSleep()
+ *   1. blockInuse_blockClientOnKeys() -
+ *      The client is marked as blockInuse_blocked.
+ *      Two mappings are updated:
+ *        - client -> keys: record all keys this client is waiting on.
+ *        - key -> clients: for each key, add this client to the key’s
+ *          blocking client list.
+ *
+ *   2. Keys are unblocked individually via blockInuse_unblockClientsOnKey().
+ *      For each key:
+ *        - all clients are removed from that key’s blocking list
+ *          (key -> clients),
+ *        - and the corresponding key entry is removed from each client’s
+ *          client -> keys mapping.
+ *
+ *   3. After a key is processed, if a client is no longer blocked on
+ *      any remaining keys (i.e., its client -> keys set becomes empty),
+ *      the client is:
+ *        - fully removed from the blocking mappings,
+ *        - the blockInuse_blocked flag is cleared,
+ *        - added to the server unblocked list,
+ *        - and the unblocked flag is set.
+ *
+ *   4. processUnblockedClients() (called from beforeSleep()) -
+ *      The client is removed from the unblocked list, the unblocked flag
+ *      is cleared, and its read handler is restored.
+ *
+ *   5. If a parsed (but unexecuted) command exists, it is executed.
+ *      The server then continues parsing and executing commands from the
+ *      remaining input buffer until the buffer is empty or the client
+ *      becomes blocked again.
+ *
  *
  * This is used to ensure data consistency during operations that require
  * exclusive access to keys, preventing race conditions and maintaining
  * transactional integrity.
- *
  */
 
 #ifndef BLOCKED_INUSE_H__
 #define BLOCKED_INUSE_H__
 
-#include "hashtable.h"
-#include "adlist.h"
-
 struct robj;   // defined in server.h
 struct client; // defined in server.h
 
 /* Check if client is blocked by blockInuse */
-#define blockInuse_clientBlocked(c) ((c)->flag.blockInuse_blocked)
+int blockInuse_clientBlocked(client *c);
 
 /* Initialize blockInuse structures, must be called once during server startup. */
 void blockInuse_init(void);
 
-/* Free blockInuse data structures, no clients must be blocked by blockInuse. */
+/* Free blockInuse data structures, no clients should be blocked by blockInuse at this time. */
 void blockInuse_release(void);
 
 /* Return the number of clients currently blocked by blockInuse. */
 int blockInuse_getNumberOfBlockedClients(void);
 
+/* Return the number of keys currently blocked by blockInuse. */
+int blockInuse_getNumberOfBlockedKeys(void);
+
 /*
- * Block a client on a set of keys. Duplicate keys are allowed and handled.
- *
- * To avoid extra copying, this API keeps references to the passed key objects.
- * The caller must ensure that the `keys` array and all key objects are
- * heap-allocated and remain valid for the duration of the block.
- *
- * Preconditions:
- *  - The client must not already have any blocked or unblocked flags set.
- *
- * Return value:
- *  - C_ERR if:
- *      a. nKeys == 0
- *      b. any key is not a sds string object
- *      c. the client is a replica client
- *  - C_OK otherwise; the client is blocked until all keys are unblocked.
+ * Block a client on a list of keys. Duplicate keys are allowed and handled.
  */
-int blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]);
+void blockInuse_blockClientOnKeys(client *c, int nKeys, robj *keys[]);
 
 /*
  * Unblock clients blocked on the given key.
@@ -92,10 +102,9 @@ void blockInuse_unblockClientsOnAllKeys(void);
 
 /*
  * Unlink a client currently blocked by blockInuse. Typically used when
- * a client is being freed while still blocked (e.g., due to memory pressure).
+ * a client is being freed while still blocked (e.g., client-initiated disconnect).
  *
- * This function removes the client from all blockInuse data structures
- * and clears its blockInuse blocked flag.
+ * This function removes the client from all blockInuse data structures.
  */
 void blockInuse_unlinkClient(client *c);
 
