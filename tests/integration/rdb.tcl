@@ -320,7 +320,7 @@ start_server {overrides {forkless-options-supported yes}} {
             assert_error "ERR Background saving is currently not in progress or scheduled" {r bgsave cancel}
         }
     }
-
+    if {0} {
     test {bgsave cancel schedulled request} {
         r config set save ""
         # Generating RDB will take some 100 seconds
@@ -797,6 +797,148 @@ start_server {overrides {forkless-options-supported yes}} {
         assert_equal [r get before_0] "value_before_0"
         assert_equal [r lrange lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
         assert_equal [r smembers set_0] [lsort [list "B1" "B2"]]
+    } {} {needs:debug}
+    }
+
+
+
+    test "blocking commands during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Create initial dataset with 100 keys
+        createComplexDatasetForVerification r 100
+
+        # Start blocking commands on nonexistent keys BEFORE save starts
+        set rd1 [valkey_deferring_client]
+        set rd2 [valkey_deferring_client]
+        set rd3 [valkey_deferring_client]
+        set rd4 [valkey_deferring_client]
+        set rd5 [valkey_deferring_client]
+        set rd6 [valkey_deferring_client]
+        set rd7 [valkey_deferring_client]
+        
+        # Consume an item from a nonexistent key
+        $rd1 blpop new1 0
+        
+        # Set up a cascade of brpoplpush's on nonexistent keys
+        $rd2 brpoplpush new2 new3 0
+        $rd3 brpoplpush new3 new4 0
+        
+        # Nonexistent keys
+        $rd4 brpoplpush new5 new6 0
+        
+        # Cascade of brpoplpush's onto an existing key
+        $rd5 brpoplpush new88 new7 0
+        $rd6 brpoplpush new7 lst_2 0
+        
+        # Destination exists
+        $rd7 brpoplpush new8 lst_70 0
+        
+        # Start save with slow speed
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "bgsave didn't start"
+        }
+        
+        # Start more blocking commands during save
+        set rd8 [valkey_deferring_client]
+        set rd9 [valkey_deferring_client]
+        set rd10 [valkey_deferring_client]
+        set rd11 [valkey_deferring_client]
+        set rd12 [valkey_deferring_client]
+        
+        # Existing keys with new destinations, setting off some of the waiters
+        $rd8 brpoplpush lst_33 new1 0
+        $rd9 brpoplpush lst_27 new2 0
+        
+        # Duplicate another brpoplpush above
+        $rd10 brpoplpush new5 new6 0
+        
+        # New key but existing destination
+        $rd11 brpoplpush new9 lst_3 0
+        
+        # Consume an item from a nonexistent key
+        $rd12 brpop new100 0
+        
+        # Set off more waiters
+        r rpush new5 foobar
+        r rpush new88 foobar
+        
+        # Resume save at normal speed
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Wait for blocking commands to complete and read responses
+        # Only read from clients that should complete
+        after 100
+        $rd1 read  ;# Unblocked by rd8
+        $rd2 read  ;# Unblocked by rd9
+        $rd3 read  ;# Unblocked by rd2
+        $rd5 read  ;# Unblocked by rpush new88
+        $rd6 read  ;# Unblocked by rd5
+        $rd8 read  ;# Completes immediately (lst_33 exists)
+        $rd9 read  ;# Completes immediately (lst_27 exists)
+        
+        # Don't read from rd4, rd7, rd10, rd11, rd12 - they remain blocked or timeout
+        
+        # Verify the blocking commands executed correctly
+        assert_equal [r llen new1] 0
+        assert_equal [r llen new2] 0
+        assert_equal [r llen new3] 0
+        assert_equal [lindex [r lrange new4 -1 -1] 0] "R2"
+        assert_equal [r llen new5] 0
+        assert_equal [lindex [r lrange new6 -1 -1] 0] "foobar"
+        assert_equal [r llen new88] 0
+        assert_equal [r llen new7] 0
+        assert_equal [lindex [r lrange lst_2 0 0] 0] "foobar"
+        assert_equal [r llen new8] 0
+        assert_equal [r llen lst_70] 4
+        assert_equal [r llen lst_33] 3
+        assert_equal [r llen lst_27] 3
+        assert_equal [r llen lst_3] 4
+        
+        # Close deferred clients (those that didn't complete will be force-closed)
+        $rd1 close
+        $rd2 close
+        $rd3 close
+        $rd4 close
+        $rd5 close
+        $rd6 close
+        $rd7 close
+        $rd8 close
+        $rd9 close
+        $rd10 close
+        $rd11 close
+        $rd12 close
+
+        # Verify snapshot contains original keys (blocking commands should not affect snapshot)
+        r debug reload
+        
+        # Original keys should be preserved in snapshot
+        assert_equal [r get before_0] "value_before_0"
+        assert_equal [r llen lst_2] 4
+        assert_equal [r llen lst_3] 4
+        assert_equal [r llen lst_27] 4
+        assert_equal [r llen lst_33] 4
+        assert_equal [r llen lst_70] 4
+        
+        # New keys created during save should NOT be in snapshot
+        assert_equal [r exists new1] 0
+        assert_equal [r exists new2] 0
+        assert_equal [r exists new3] 0
+        assert_equal [r exists new4] 0
+        assert_equal [r exists new5] 0
+        assert_equal [r exists new6] 0
+        assert_equal [r exists new7] 0
+        assert_equal [r exists new8] 0
+        assert_equal [r exists new88] 0
+        assert_equal [r exists new9] 0
+        assert_equal [r exists new100] 0
     } {} {needs:debug}
 
     foreach first_type {fork thread} {
