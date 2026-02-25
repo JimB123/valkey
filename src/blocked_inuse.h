@@ -60,7 +60,6 @@
 #ifndef BLOCKED_INUSE_H__
 #define BLOCKED_INUSE_H__
 
-struct robj;   // defined in server.h
 struct client; // defined in server.h
 
 /* Check if client is blocked by blockInuse */

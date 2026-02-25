@@ -59,6 +59,7 @@ extern "C" {
  *       Example: serverLog(int level, const char *fmt, ...) should NOT be mocked.
  */
 long long __wrap_aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds, aeTimeProc *proc, void *clientData, aeEventFinalizerProc *finalizerProc);
+robj *__wrap_lookupKeyRead(serverDb *db, robj *key);
 #undef protected
 #undef _Bool
 #undef typename
