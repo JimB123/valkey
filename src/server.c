@@ -1993,7 +1993,12 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Try to process more IO reads that are ready to be processed. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
         int io_responses_after = processIOThreadsReadDone();
-        if (io_responses_after > 0) server.el_iteration_active = true;
+        if (io_responses_after > 0) {
+            server.el_iteration_active = true;
+
+            /* Any responses that failed to enqueue to IO threads need to be handled now */
+            handleClientsWithPendingWrites();
+        }
     }
 
     int io_writes = processIOThreadsWriteDone();
@@ -7304,9 +7309,9 @@ static sds expandProcTitleTemplate(const char *template, const char *title) {
     return sdstrim(res, " ");
 }
 /* Validate the specified template, returns 1 if valid or 0 otherwise. */
-int validateProcTitleTemplate(const char *template) {
+int validateProcTitleTemplate(const char *templ) {
     int ok = 1;
-    sds res = expandProcTitleTemplate(template, "");
+    sds res = expandProcTitleTemplate(templ, "");
     if (!res) return 0;
     if (sdslen(res) == 0) ok = 0;
     sdsfree(res);

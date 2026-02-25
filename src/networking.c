@@ -974,13 +974,23 @@ void addReplyErrorSdsSafe(client *c, sds err) {
     addReplyErrorSdsEx(c, err, 0);
 }
 
+/* Add error reply to the given client.
+ * Supported flags:
+ * ERR_REPLY_FLAG_NO_STATS_UPDATE - indicate not to perform any error stats updates
+ * As a side effect the SDS string is freed. */
+void addReplyErrorSdsExSafe(client *c, sds err, int flags) {
+    err = sdstrim(err, "\r\n");
+    err = sdsmapchars(err, "\r\n", "  ", 2);
+    addReplyErrorSdsEx(c, err, flags);
+}
+
 /* Internal function used by addReplyErrorFormat, addReplyErrorFormatEx and RM_ReplyWithErrorFormat.
  * Refer to afterErrorReply for more information about the flags. */
 void addReplyErrorFormatInternal(client *c, int flags, const char *fmt, va_list ap) {
-    va_list cpy;
-    va_copy(cpy, ap);
-    sds s = sdscatvprintf(sdsempty(), fmt, cpy);
-    va_end(cpy);
+    va_list copy;
+    va_copy(copy, ap);
+    sds s = sdscatvprintf(sdsempty(), fmt, copy);
+    va_end(copy);
     /* Trim any newlines at the end (ones will be added by addReplyErrorLength) */
     s = sdstrim(s, "\r\n");
     /* Make sure there are no newlines in the middle of the string, otherwise
@@ -2174,6 +2184,22 @@ void freeClientAsync(client *c) {
     debugServerAssertWithInfo(c, NULL, listSearchKey(server.clients_to_close, c) == NULL);
     listAddNodeTail(server.clients_to_close, c);
 }
+/* Helper function to free a client or flag it for closure after current command.
+ * We can't free the current client right now because that would trigger an
+ * assert in prepareClientToWrite() when the server tries to write the response.
+ * So instead flag it for closure after the current command completes. */
+void freeClientOrCloseLater(client *c, int async) {
+    if (c == server.current_client) {
+        c->flag.close_after_command = 1;
+    } else {
+        if (async) {
+            freeClientAsync(c);
+        } else {
+            freeClient(c);
+        }
+    }
+}
+
 
 /* Log errors for invalid use and free the client in async way.
  * We will add additional information about the client to the message. */
@@ -3087,12 +3113,14 @@ parseResult handleParseResults(client *c) {
         /* in case the client's query was an empty line we will ignore it and proceed to process the rest of the buffer
          * if any */
         resetClient(c);
+        c->reqtype = 0;
         return PARSE_OK;
     }
 
     if (c->read_flags & READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN) {
         /* Multibulk processing could see a <= 0 length. */
         resetClient(c);
+        c->reqtype = 0;
         return PARSE_OK;
     }
 
@@ -6003,8 +6031,8 @@ int getClientTypeByName(char *name) {
         return -1;
 }
 
-char *getClientTypeName(int class) {
-    switch (class) {
+char *getClientTypeName(int client_class) {
+    switch (client_class) {
     case CLIENT_TYPE_NORMAL: return "normal";
     case CLIENT_TYPE_REPLICA: return "slave";
     case CLIENT_TYPE_PUBSUB: return "pubsub";
@@ -6548,4 +6576,72 @@ void ioThreadWriteToClient(void *data) {
 
     atomic_thread_fence(memory_order_release);
     c->io_write_state = CLIENT_COMPLETED_IO;
+}
+
+/* ========================== Wrapper Functions for Testing ========================== */
+/* These wrapper functions expose static functions for use in GoogleTest unit tests.
+ * They are non-static wrappers that simply call the corresponding static functions. */
+
+void testOnlyPostWriteToReplica(client *c) {
+    postWriteToReplica(c);
+}
+
+void testOnlyWriteToReplica(client *c) {
+    writeToReplica(c);
+}
+
+void testOnlyBackupAndUpdateClientArgv(client *c, int new_argc, robj **new_argv) {
+    backupAndUpdateClientArgv(c, new_argc, new_argv);
+}
+
+size_t testOnlyUpsertPayloadHeader(char *buf, size_t *bufpos, payloadHeader **last_header, uint8_t type, size_t len, int slot, size_t available) {
+    return upsertPayloadHeader(buf, bufpos, last_header, type, len, slot, 0, available);
+}
+
+int testOnlyIsCopyAvoidPreferred(client *c, robj *obj) {
+    return isCopyAvoidPreferred(c, obj);
+}
+
+size_t testOnlyAddReplyPayloadToBuffer(client *c, const void *payload, size_t len, uint8_t payload_type) {
+    return _addReplyPayloadToBuffer(c, payload, len, payload_type);
+}
+
+size_t testOnlyAddBulkStrRefToBuffer(client *c, const void *payload, size_t len) {
+    return _addBulkStrRefToBuffer(c, payload, len);
+}
+
+void testOnlyAddReplyPayloadToList(client *c, list *reply_list, const char *payload, size_t len, uint8_t payload_type) {
+    _addReplyPayloadToList(c, reply_list, payload, len, payload_type);
+}
+
+void testOnlyAddBulkStrRefToToList(client *c, const void *payload, size_t len) {
+    _addBulkStrRefToToList(c, payload, len);
+}
+
+void testOnlyAddBulkStrRefToBufferOrList(client *c, robj *obj) {
+    _addBulkStrRefToBufferOrList(c, obj);
+}
+
+void testOnlyInitReplyIOV(client *c, int iovsize, struct iovec *iov_arr, char (*prefixes)[BULK_STR_LEN_PREFIX_MAX_SIZE], char *crlf, replyIOV *reply) {
+    initReplyIOV(c, iovsize, iov_arr, prefixes, crlf, reply);
+}
+
+void testOnlyAddPlainBufferToReplyIOV(char *buf, size_t buf_len, replyIOV *reply, bufWriteMetadata *metadata) {
+    addPlainBufferToReplyIOV(buf, buf_len, reply, metadata);
+}
+
+void testOnlyAddBulkStringToReplyIOV(char *buf, size_t buf_len, replyIOV *reply, bufWriteMetadata *metadata) {
+    addBulkStringToReplyIOV(buf, buf_len, reply, metadata);
+}
+
+void testOnlyAddEncodedBufferToReplyIOV(char *buf, size_t bufpos, replyIOV *reply, bufWriteMetadata *metadata) {
+    addEncodedBufferToReplyIOV(buf, bufpos, reply, metadata);
+}
+
+void testOnlyAddBufferToReplyIOV(int encoded, char *buf, size_t bufpos, replyIOV *reply, bufWriteMetadata *metadata) {
+    addBufferToReplyIOV(encoded, buf, bufpos, reply, metadata);
+}
+
+void testOnlySaveLastWrittenBuf(client *c, bufWriteMetadata *metadata, int bufcnt, size_t totlen, size_t totwritten) {
+    saveLastWrittenBuf(c, metadata, bufcnt, totlen, totwritten);
 }

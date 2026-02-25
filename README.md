@@ -59,6 +59,11 @@ C++ compiler and run:
 
     % make USE_FAST_FLOAT=yes
 
+To build with enhanced stack traces that include file names and line numbers
+for all functions (including static functions), use libbacktrace:
+
+    % make USE_LIBBACKTRACE=yes
+
 To build Valkey without the Lua engine:
 
     % make BUILD_LUA=no
@@ -336,7 +341,7 @@ Other options supported by Valkey's `CMake` build system:
 - `-DBUILD_RDMA=<no|module>` enable RDMA module build (only module mode supported). Default: `no`
 - `-DBUILD_MALLOC=<libc|jemalloc|tcmalloc|tcmalloc_minimal>` choose the allocator to use. Default on Linux: `jemalloc`, for other OS: `libc`
 - `-DBUILD_SANITIZER=<address|thread|undefined>` build with address sanitizer enabled. Default: disabled (no sanitizer)
-- `-DBUILD_UNIT_TESTS=[yes|no]`  when set, the build will produce the executable `valkey-unit-tests`. Default: `no`
+- `-DBUILD_UNIT_GTESTS=[yes|no]`  when set, the build will produce unit tests executable `valkey-unit-gtests`. Default: `no`
 - `-DBUILD_TEST_MODULES=[yes|no]`  when set, the build will include the modules located under the `tests/modules` folder. Default: `no`
 - `-DBUILD_EXAMPLE_MODULES=[yes|no]`  when set, the build will include the example modules located under the `src/modules` folder. Default: `no`
 

@@ -40,7 +40,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#ifndef __cplusplus
 #include <stdatomic.h>
+#endif
 #include <string.h>
 #include <time.h>
 #include <limits.h>
@@ -57,7 +59,7 @@
 #include <systemd/sd-daemon.h>
 #endif
 
-#ifndef static_assert
+#if !defined(static_assert) && !defined(__cplusplus)
 #define static_assert _Static_assert
 #endif
 
@@ -112,6 +114,8 @@ typedef struct serverObject robj;
 #include "crc64.h"
 
 struct hdr_histogram;
+struct ValkeyModule;
+
 
 /* helpers */
 #define numElements(x) (sizeof(x) / sizeof((x)[0]))
@@ -2825,7 +2829,7 @@ uint64_t crc64(uint64_t crc, const unsigned char *s, uint64_t l);
 void exitFromChild(int retcode);
 long long serverPopcount(void *s, long count);
 int serverSetProcTitle(char *title);
-int validateProcTitleTemplate(const char *template);
+int validateProcTitleTemplate(const char *templ);
 int serverCommunicateSystemd(const char *sd_notify_msg);
 void serverSetCpuAffinity(const char *cpulist);
 void dictVanillaFree(void *val);
@@ -2878,6 +2882,7 @@ void dictVanillaFree(void *val);
 client *createClient(connection *conn);
 void freeClient(client *c);
 void freeClientAsync(client *c);
+void freeClientOrCloseLater(client *c, int async);
 void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...);
 void beforeNextClient(client *c);
 void clearClientConnectionState(client *c);
@@ -2924,6 +2929,7 @@ void addReplyOrErrorObject(client *c, robj *reply);
 void afterErrorReply(client *c, const char *s, size_t len, int flags);
 void addReplyErrorFormatInternal(client *c, int flags, const char *fmt, va_list ap);
 void addReplyErrorSdsEx(client *c, sds err, int flags);
+void addReplyErrorSdsExSafe(client *c, sds err, int flags);
 void addReplyErrorSds(client *c, sds err);
 void addReplyErrorSdsSafe(client *c, sds err);
 void addReplyError(client *c, const char *err);
@@ -2968,7 +2974,7 @@ int freeClientsInAsyncFreeQueue(void);
 int closeClientOnOutputBufferLimitReached(client *c, int async);
 int getClientType(client *c);
 int getClientTypeByName(char *name);
-char *getClientTypeName(int class);
+char *getClientTypeName(int client_class);
 void flushReplicasOutputBuffers(void);
 void disconnectReplicas(void);
 void evictClients(void);
@@ -3278,6 +3284,7 @@ int isMutuallyExclusiveChildType(int type);
 extern rax *Users;
 extern user *DefaultUser;
 void ACLInit(void);
+int ACLModuleHasCommandRules(const struct ValkeyModule *module, sds *rule_out);
 /* Return values for ACLCheckAllPerm(). */
 #define ACL_OK 0                    /* Permission granted */
 #define ACL_DENIED_DB 1             /* Database access denied */
