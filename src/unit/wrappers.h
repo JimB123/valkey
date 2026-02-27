@@ -60,6 +60,8 @@ extern "C" {
  */
 long long __wrap_aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds, aeTimeProc *proc, void *clientData, aeEventFinalizerProc *finalizerProc);
 robj *__wrap_lookupKeyRead(serverDb *db, robj *key);
+int __wrap_processPendingCommandAndInputBuffer(client *c);
+void __wrap_beforeNextClient(client *c);
 #undef protected
 #undef _Bool
 #undef typename
