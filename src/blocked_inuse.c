@@ -199,9 +199,8 @@ int blockInuse_clientBlocked(client *c) {
  * Initialize blockInuse data structures.
  */
 void blockInuse_init(void) {
-    static int initialized = 0;
-    serverAssert(!initialized);
-    initialized = 1;
+    serverAssert(!client_to_keys);
+    serverAssert(!key_to_clients);
     client_to_keys = hashtableCreate(&clientDataHashtableType);
     key_to_clients = hashtableCreate(&keyToClientsHashtableType);
 }
