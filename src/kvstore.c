@@ -240,7 +240,7 @@ void kvstoreHashtableRehashingStarted(hashtable *ht) {
     size_t from, to;
     hashtableRehashingInfo(ht, &from, &to);
     kvs->bucket_count += to; /* Started rehashing (Add the new ht size) */
-    kvs->overhead_hashtable_rehashing += from * HASHTABLE_BUCKET_SIZE;
+    kvs->overhead_hashtable_rehashing += from * hashtableBucketSize(ht);
 }
 
 /* Remove hash table from the rehashing list.
@@ -258,7 +258,7 @@ void kvstoreHashtableRehashingCompleted(hashtable *ht) {
     size_t from, to;
     hashtableRehashingInfo(ht, &from, &to);
     kvs->bucket_count -= from; /* Finished rehashing (Remove the old ht size) */
-    kvs->overhead_hashtable_rehashing -= from * HASHTABLE_BUCKET_SIZE;
+    kvs->overhead_hashtable_rehashing -= from * hashtableBucketSize(ht);
 }
 
 /* Hashtable callback to keep track of memory usage. */

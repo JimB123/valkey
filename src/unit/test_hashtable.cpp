@@ -1750,3 +1750,309 @@ TEST_F(HashtableTest, scan_no_duplicates_during_expand_rehash) {
     hashtableResumeAutoShrink(ht);
     hashtableRelease(ht);
 }
+
+/* --- Hashtable with values (map) --- */
+
+/* Keys are pointer-sized integers. The value associated with key j is
+ * mapValueOf(j), so values can be verified after entries have moved around
+ * due to rehashing, chaining and compaction. */
+static void *mapValueOf(long j) {
+    return (void *)(uintptr_t)(j * 7 + 3);
+}
+
+static long map_value_destructor_calls;
+
+static void mapValueDestructor(void *value) {
+    UNUSED(value);
+    map_value_destructor_calls++;
+}
+
+static void initMapType(hashtableType *type) {
+    memset(type, 0, sizeof(*type));
+    type->has_values = 1;
+    type->valueDestructor = mapValueDestructor;
+    type->trackMemUsage = trackmemusage;
+}
+
+/* Checks that keys [from, to) with 'j % step == 0' are present with the
+ * right value. */
+static void mapVerify(hashtable *ht, long from, long to, long step) {
+    for (long j = from; j < to; j++) {
+        if (j % step != 0) continue;
+        void *found = NULL;
+        void *value = NULL;
+        ASSERT_TRUE(hashtableFindWithValue(ht, (void *)j, &found, &value));
+        ASSERT_EQ((long)found, j);
+        ASSERT_EQ(value, mapValueOf(j));
+    }
+}
+
+static void map_add_find_delete_test_helper() {
+    long count = accurate ? 1000000 : 50000;
+    hashtableType type;
+    initMapType(&type);
+    hashtable *ht = hashtableCreate(&type);
+    map_value_destructor_calls = 0;
+
+    ASSERT_TRUE(hashtableHasValues(ht));
+    ASSERT_EQ(hashtableBucketSize(ht), (size_t)(2 * HASHTABLE_BUCKET_SIZE));
+
+    /* Add. Enough entries to cause both rehashing and bucket chaining. */
+    long j;
+    for (j = 0; j < count; j++) {
+        ASSERT_TRUE(hashtableAddWithValue(ht, (void *)j, mapValueOf(j)));
+    }
+    ASSERT_EQ(hashtableSize(ht), (size_t)count);
+    ASSERT_EQ(hashtableMemUsage(ht), mem_usage);
+    ASSERT_GT(hashtableChainedBuckets(ht, 0) + hashtableChainedBuckets(ht, 1), 0u);
+    mapVerify(ht, 0, count, 1);
+
+    /* Adding an existing key returns the existing entry and value. */
+    void *existing = NULL, *existing_value = NULL;
+    ASSERT_FALSE(hashtableAddOrFindWithValue(ht, (void *)5, (void *)0x1, &existing, &existing_value));
+    ASSERT_EQ((long)existing, 5);
+    ASSERT_EQ(existing_value, mapValueOf(5));
+
+    /* Update values in place via the value ref, then restore them. */
+    for (j = 0; j < count; j++) {
+        void **ref = hashtableFindValueRef(ht, (void *)j);
+        ASSERT_NE(ref, nullptr);
+        ASSERT_EQ(*ref, mapValueOf(j));
+        *ref = mapValueOf(j + 1);
+    }
+    for (j = 0; j < count; j++) {
+        void *value;
+        ASSERT_TRUE(hashtableFindWithValue(ht, (void *)j, NULL, &value));
+        ASSERT_EQ(value, mapValueOf(j + 1));
+        *hashtableFindValueRef(ht, (void *)j) = mapValueOf(j);
+    }
+    ASSERT_EQ(hashtableFindValueRef(ht, (void *)count), nullptr);
+
+    /* Delete 95% of the entries, triggering shrink rehashing. Use pop for some
+     * and delete for the others. */
+    long deleted = 0;
+    for (j = 0; j < count; j++) {
+        if (j % 20 == 0) continue;
+        if (j % 3 == 0) {
+            void *popped, *popped_value;
+            ASSERT_TRUE(hashtablePopWithValue(ht, (void *)j, &popped, &popped_value));
+            ASSERT_EQ((long)popped, j);
+            ASSERT_EQ(popped_value, mapValueOf(j));
+        } else {
+            ASSERT_TRUE(hashtableDelete(ht, (void *)j));
+            deleted++;
+        }
+        /* Check a sample of the survivors now and then, while rehashing and
+         * compaction are moving entries around. */
+        if (j % 4999 == 0) mapVerify(ht, 0, count, 20);
+    }
+    ASSERT_EQ(map_value_destructor_calls, deleted);
+    ASSERT_EQ(hashtableSize(ht), (size_t)((count + 19) / 20));
+    ASSERT_EQ(hashtableMemUsage(ht), mem_usage);
+    mapVerify(ht, 0, count, 20);
+
+    /* Empty calls the value destructor for the remaining entries. */
+    long remaining = hashtableSize(ht);
+    hashtableEmpty(ht, NULL);
+    ASSERT_EQ(map_value_destructor_calls, deleted + remaining);
+
+    hashtableRelease(ht);
+}
+
+TEST_F(HashtableTest, map_add_find_delete) {
+    size_t used_memory_before = zmalloc_used_memory();
+    map_add_find_delete_test_helper();
+    ASSERT_EQ(zmalloc_used_memory(), used_memory_before);
+}
+
+TEST_F(HashtableTest, map_add_find_delete_avoid_resize) {
+    size_t used_memory_before = zmalloc_used_memory();
+    hashtableSetResizePolicy(HASHTABLE_RESIZE_AVOID);
+    map_add_find_delete_test_helper();
+    hashtableSetResizePolicy(HASHTABLE_RESIZE_ALLOW);
+    ASSERT_EQ(zmalloc_used_memory(), used_memory_before);
+}
+
+TEST_F(HashtableTest, map_old_api_stores_null_values) {
+    hashtableType type;
+    initMapType(&type);
+    hashtable *ht = hashtableCreate(&type);
+    long j;
+
+    /* Fill, delete everything, and re-add using the API without values, so
+     * that slots are reused. The values must read back as NULL. */
+    for (j = 0; j < 1000; j++) ASSERT_TRUE(hashtableAddWithValue(ht, (void *)j, mapValueOf(j)));
+    hashtablePauseAutoShrink(ht);
+    for (j = 0; j < 1000; j++) ASSERT_TRUE(hashtablePop(ht, (void *)j, NULL));
+    for (j = 0; j < 1000; j++) ASSERT_TRUE(hashtableAdd(ht, (void *)j));
+    hashtableResumeAutoShrink(ht);
+    for (j = 0; j < 1000; j++) {
+        void *value = (void *)0x1;
+        ASSERT_TRUE(hashtableFindWithValue(ht, (void *)j, NULL, &value));
+        ASSERT_EQ(value, nullptr);
+    }
+
+    /* For a hashtable without values, the value getters return NULL. */
+    hashtableType set_type = {};
+    hashtable *set = hashtableCreate(&set_type);
+    ASSERT_FALSE(hashtableHasValues(set));
+    ASSERT_EQ(hashtableBucketSize(set), (size_t)HASHTABLE_BUCKET_SIZE);
+    ASSERT_TRUE(hashtableAdd(set, (void *)1));
+    void *value = (void *)0x1;
+    ASSERT_TRUE(hashtableFindWithValue(set, (void *)1, NULL, &value));
+    ASSERT_EQ(value, nullptr);
+
+    hashtableRelease(set);
+    hashtableRelease(ht);
+}
+
+TEST_F(HashtableTest, map_safe_iterator_delete) {
+    long count = 20000;
+    hashtableType type;
+    initMapType(&type);
+    hashtable *ht = hashtableCreate(&type);
+    long j;
+    for (j = 0; j < count; j++) {
+        ASSERT_TRUE(hashtableAddWithValue(ht, (void *)j, mapValueOf(j)));
+    }
+
+    /* Delete the odd keys while iterating. Compaction of bucket chains is done
+     * by the iterator and must move values along with the entries. */
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, ht, HASHTABLE_ITER_SAFE);
+    void *next, *value;
+    long num_returned = 0;
+    while (hashtableNextWithValue(&iter, &next, &value)) {
+        j = (long)next;
+        ASSERT_EQ(value, mapValueOf(j));
+        num_returned++;
+        if (j % 2 == 1) {
+            ASSERT_TRUE(hashtableDelete(ht, next));
+        }
+    }
+    hashtableCleanupIterator(&iter);
+    ASSERT_EQ(num_returned, count);
+    ASSERT_EQ(hashtableSize(ht), (size_t)(count / 2));
+    mapVerify(ht, 0, count, 2);
+
+    hashtableRelease(ht);
+}
+
+typedef struct {
+    long scanned;
+    long bad_values;
+} mapScanData;
+
+static void mapScanFn(void *privdata, void *entry, void **valueref) {
+    mapScanData *data = (mapScanData *)privdata;
+    long j = (long)entry;
+    if (*valueref != mapValueOf(j)) data->bad_values++;
+    /* Replace the value in place via the ref. */
+    *valueref = mapValueOf(j + 1);
+    data->scanned++;
+}
+
+TEST_F(HashtableTest, map_scan) {
+    long count = 20000;
+    hashtableType type;
+    initMapType(&type);
+    hashtable *ht = hashtableCreate(&type);
+    long j;
+    for (j = 0; j < count; j++) {
+        ASSERT_TRUE(hashtableAddWithValue(ht, (void *)j, mapValueOf(j)));
+    }
+    /* Finish rehashing so the scan emits each entry exactly once. */
+    while (hashtableIsRehashing(ht)) hashtableRehashMicroseconds(ht, 1000);
+
+    mapScanData data = {0, 0};
+    size_t cursor = 0;
+    do {
+        cursor = hashtableScanWithValues(ht, cursor, mapScanFn, &data);
+    } while (cursor != 0);
+    ASSERT_EQ(data.scanned, count);
+    ASSERT_EQ(data.bad_values, 0);
+
+    /* All values were updated via the value refs. */
+    for (j = 0; j < count; j++) {
+        void *value;
+        ASSERT_TRUE(hashtableFindWithValue(ht, (void *)j, NULL, &value));
+        ASSERT_EQ(value, mapValueOf(j + 1));
+    }
+
+    hashtableRelease(ht);
+}
+
+TEST_F(HashtableTest, map_two_phase_insert_and_pop) {
+    long count = 5000;
+    hashtableType type;
+    initMapType(&type);
+    hashtable *ht = hashtableCreate(&type);
+    long j;
+
+    for (j = 0; j < count; j++) {
+        hashtablePosition position;
+        ASSERT_TRUE(hashtableFindPositionForInsert(ht, (void *)j, &position, nullptr));
+        hashtableInsertAtPositionWithValue(ht, (void *)j, mapValueOf(j), &position);
+    }
+    mapVerify(ht, 0, count, 1);
+
+    map_value_destructor_calls = 0;
+    for (j = 0; j < count; j++) {
+        hashtablePosition position;
+        void **ref = hashtableTwoPhasePopFindRef(ht, (void *)j, &position);
+        ASSERT_NE(ref, nullptr);
+        ASSERT_EQ((long)*ref, j);
+        ASSERT_EQ(*hashtablePositionValueRef(ht, &position), mapValueOf(j));
+        hashtableTwoPhasePopDelete(ht, &position);
+    }
+    ASSERT_EQ(hashtableSize(ht), 0u);
+    /* Two-phase pop doesn't call destructors. */
+    ASSERT_EQ(map_value_destructor_calls, 0);
+
+    hashtableRelease(ht);
+}
+
+TEST_F(HashtableTest, map_find_batch) {
+    long count = 10000;
+    hashtableType type;
+    initMapType(&type);
+    hashtable *ht = hashtableCreate(&type);
+    long j;
+    for (j = 0; j < count; j++) {
+        ASSERT_TRUE(hashtableAddWithValue(ht, (void *)j, mapValueOf(j)));
+    }
+
+    /* Look up batches containing both present and missing keys. */
+    const int batch = HASHTABLE_FIND_BATCH_MAX_SIZE;
+    for (long start = 0; start < count * 2; start += batch) {
+        const void *keys[HASHTABLE_FIND_BATCH_MAX_SIZE];
+        void *entries[HASHTABLE_FIND_BATCH_MAX_SIZE];
+        void *values[HASHTABLE_FIND_BATCH_MAX_SIZE];
+        for (int i = 0; i < batch; i++) {
+            /* Every other key is beyond 'count' and thus missing. */
+            keys[i] = (void *)(start + i * 2);
+        }
+        uint32_t found = hashtableFindBatchWithValues(ht, batch, keys, entries, values);
+        for (int i = 0; i < batch; i++) {
+            long key = (long)keys[i];
+            if (key < count) {
+                ASSERT_TRUE(found & ((uint32_t)1 << i));
+                ASSERT_EQ((long)entries[i], key);
+                ASSERT_EQ(values[i], mapValueOf(key));
+            } else {
+                ASSERT_FALSE(found & ((uint32_t)1 << i));
+            }
+        }
+    }
+
+    /* Single incremental find. */
+    hashtableIncrementalFindState state;
+    hashtableIncrementalFindInit(&state, ht, (void *)42);
+    while (hashtableIncrementalFindStep(&state));
+    void *entry, *value;
+    ASSERT_TRUE(hashtableIncrementalFindGetResultWithValue(&state, &entry, &value));
+    ASSERT_EQ((long)entry, 42);
+    ASSERT_EQ(value, mapValueOf(42));
+
+    hashtableRelease(ht);
+}

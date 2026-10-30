@@ -63,6 +63,9 @@ typedef struct {
     /* Callback to free an entry when it's overwritten or deleted.
      * Optional. */
     void (*entryDestructor)(void *entry);
+    /* Callback to free the value associated with an entry when the entry is
+     * deleted. Only used if 'has_values' is set. Optional. */
+    void (*valueDestructor)(void *value);
     /* Callback to prefetch the value associated with a hashtable entry. */
     void (*entryPrefetchValue)(const void *entry);
     /* Callback to control when resizing should be allowed. */
@@ -80,6 +83,10 @@ typedef struct {
     size_t (*getMetadataSize)(void);
     /* Flag to disable incremental rehashing */
     unsigned instant_rehashing : 1;
+    /* Flag to make the hashtable a map. Each entry gets an associated value
+     * pointer, stored in a second cache line of the bucket. Use the
+     * "WithValue(s)" API variants to access the values. */
+    unsigned has_values : 1;
 
 } hashtableType;
 
@@ -90,9 +97,15 @@ typedef enum {
 } hashtableResizePolicy;
 
 typedef void (*hashtableScanFunction)(void *privdata, void *entry);
+/* Scan callback for hashtables with values. 'entry' is the entry (or a
+ * reference to it, with HASHTABLE_SCAN_EMIT_REF) and 'valueref' points to
+ * where the associated value is stored in the table. */
+typedef void (*hashtableScanValueFunction)(void *privdata, void *entry, void **valueref);
 
 /* Constants */
-#define HASHTABLE_BUCKET_SIZE 64         /* bytes, the most common cache line size */
+#define HASHTABLE_BUCKET_SIZE 64         /* bytes, the most common cache line size. A hashtable
+                                          * with values uses 2 * HASHTABLE_BUCKET_SIZE per bucket;
+                                          * see hashtableBucketSize(). */
 #define HASHTABLE_FIND_BATCH_MAX_SIZE 32 /* Limited by the result bitmap size. */
 
 /* Scan flags */
@@ -129,6 +142,8 @@ size_t hashtableSize(const hashtable *ht);
 size_t hashtableBuckets(hashtable *ht);
 size_t hashtableChainedBuckets(hashtable *ht, int table);
 unsigned hashtableEntriesPerBucket(void);
+size_t hashtableBucketSize(const hashtable *ht);
+bool hashtableHasValues(const hashtable *ht);
 size_t hashtableMemUsage(const hashtable *ht);
 void hashtablePauseAutoShrink(hashtable *ht);
 void hashtableResumeAutoShrink(hashtable *ht);
@@ -165,9 +180,22 @@ void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtabl
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found);
 
+/* Entries with values (only for hashtables with 'has_values' set in the type) */
+bool hashtableFindWithValue(hashtable *ht, const void *key, void **found, void **value);
+void **hashtableFindValueRef(hashtable *ht, const void *key);
+uint32_t hashtableFindBatchWithValues(hashtable *ht, int numkeys, const void **keys, void **found_entries, void **found_values);
+bool hashtableAddWithValue(hashtable *ht, void *entry, void *value);
+bool hashtableAddOrFindWithValue(hashtable *ht, void *entry, void *value, void **existing, void **existing_value);
+void hashtableInsertAtPositionWithValue(hashtable *ht, void *entry, void *value, hashtablePosition *position);
+void **hashtablePositionValueRef(hashtable *ht, hashtablePosition *position);
+bool hashtablePopWithValue(hashtable *ht, const void *key, void **popped, void **popped_value);
+bool hashtableIncrementalFindGetResultWithValue(hashtableIncrementalFindState *state, void **found, void **value);
+
 /* Iteration & scan */
 size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata);
 size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata, void *(*defragfn)(void *), int flags);
+size_t hashtableScanWithValues(hashtable *ht, size_t cursor, hashtableScanValueFunction fn, void *privdata);
+size_t hashtableScanDefragWithValues(hashtable *ht, size_t cursor, hashtableScanValueFunction fn, void *privdata, void *(*defragfn)(void *), int flags);
 bool hashtableScanHasPassedKey(hashtable *ht, const void *key, size_t cursor);
 void hashtableInitIterator(hashtableIterator *iter, hashtable *ht, uint8_t flags);
 void hashtableRetargetIterator(hashtableIterator *iterator, hashtable *ht);
@@ -175,6 +203,7 @@ void hashtableCleanupIterator(hashtableIterator *iter);
 hashtableIterator *hashtableCreateIterator(hashtable *ht, uint8_t flags);
 void hashtableReleaseIterator(hashtableIterator *iter);
 bool hashtableNext(hashtableIterator *iter, void **elemptr);
+bool hashtableNextWithValue(hashtableIterator *iter, void **elemptr, void **valueptr);
 
 /* Random entries */
 bool hashtableRandomEntry(hashtable *ht, void **found);
