@@ -4651,6 +4651,24 @@ int clusterProcessPacket(clusterLink *link) {
 
                 /* Primary node changed for this replica? */
                 if (sender_claimed_primary && sender->replicaof != sender_claimed_primary) {
+                    /* A replica moving to another primary within its shard can only be
+                     * following a failover, so the claimed primary's config epoch can't
+                     * be older than what we already know for the shard. If it is, this
+                     * packet predates a failover we have already processed (e.g. it was
+                     * delayed on another link). Applying it could point the replica back
+                     * at a node we know replicates from it, forming a replicaof cycle. */
+                    if (sender_last_reported_as_replica && sender->replicaof &&
+                        areInSameShard(sender_claimed_primary, sender->replicaof) &&
+                        (nodeEpoch(sender) > sender_claimed_config_epoch ||
+                         nodeEpoch(sender_claimed_primary) > sender_claimed_config_epoch)) {
+                        serverLog(LL_NOTICE,
+                                  "Ignore stale message from %.40s (%s) in shard %.40s;"
+                                  " gossip config epoch: %llu, current config epoch: %llu",
+                                  sender->name, humanNodename(sender), sender->shard_id,
+                                  (unsigned long long)sender_claimed_config_epoch,
+                                  (unsigned long long)max(nodeEpoch(sender), nodeEpoch(sender_claimed_primary)));
+                        return 1;
+                    }
                     if (sender->replicaof) clusterNodeRemoveReplica(sender->replicaof, sender);
                     serverLog(LL_NOTICE, "Node %.40s (%s) is now a replica of node %.40s (%s) in shard %.40s",
                               sender->name, humanNodename(sender), sender_claimed_primary->name,
